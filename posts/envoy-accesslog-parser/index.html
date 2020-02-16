@@ -40,10 +40,7 @@
   <nav class="site-navi">
     <h1 class="site-title"><a href="/">_</a></h1>
     <ul class="site-navi-items">
-      <li class="site-navi-item-categories"><a href="/categories/" title="Categories">Categories</a></li>
       <li class="site-navi-item-tags"><a href="/tags/" title="Tags">Tags</a></li>
-      <li class="site-navi-item-archives"><a href="/archives/" title="Archives">Archives</a></li>
-      <li class="site-navi-item-about"><a href="/about/" title="About">About</a></li>
     </ul>
   </nav>
 </header>
@@ -315,12 +312,15 @@ parsing can vary.
 </p>
 <p>
 YACC can generate parsers for <code class="verbatim">LALR(1)</code> grammars (bottom up) where the best case performance
-is <code class="verbatim">O(n)</code> and worst case is <code class="verbatim">O(n * n * n)</code>
+is <code class="verbatim">O(n)</code> and worst case is <code class="verbatim">O(n^3)</code>
 </p>
 <p>
 ANTLR on the other hand generates parsers for <code class="verbatim">LL(*)</code> grammars (top down). <code class="verbatim">LL(*)</code> being very generic
 ANTLR provides language recognition modes to limit the work done by the parser provided that
 thare are some guarantees on the structure of the language.
+</p>
+<p>
+The parsing of <code class="verbatim">LL(*)</code> grammars by ANTLR is done using a method that is <a href="https://www.antlr.org/papers/allstar-techreport.pdf"><code class="verbatim">O(n^4)</code></a>
 </p>
 <p>
 Using the <code class="verbatim">SLL(*)</code> prediction mode gives a significant boost in performance:
