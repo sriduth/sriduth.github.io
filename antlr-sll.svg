@@ -1,0 +1,3416 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2134" onload="init(evt)" viewBox="0 0 1200 2134" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="2134.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="2117" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="2117" > </text>
+<g id="frames">
+<g >
+<title>antlr4::dfa::DFA::isPrecedenceDfa (22 samples, 0.16%)</title><rect x="704.7" y="2005" width="1.9" height="15.0" fill="rgb(250,130,41)" rx="2" ry="2" />
+<text  x="707.73" y="2015.5" ></text>
+</g>
+<g >
+<title>malloc (3 samples, 0.02%)</title><rect x="599.7" y="1989" width="0.3" height="15.0" fill="rgb(213,35,2)" rx="2" ry="2" />
+<text  x="602.70" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::previousTokenOnChannel (10 samples, 0.07%)</title><rect x="525.5" y="2005" width="0.8" height="15.0" fill="rgb(223,139,33)" rx="2" ry="2" />
+<text  x="528.45" y="2015.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (179 samples, 1.29%)</title><rect x="165.7" y="2053" width="15.2" height="15.0" fill="rgb(211,167,0)" rx="2" ry="2" />
+<text  x="168.71" y="2063.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="464.8" y="2005" width="0.1" height="15.0" fill="rgb(231,121,40)" rx="2" ry="2" />
+<text  x="467.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="563.7" y="2005" width="0.1" height="15.0" fill="rgb(240,37,0)" rx="2" ry="2" />
+<text  x="566.68" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ConstantContext::~ConstantContext (3 samples, 0.02%)</title><rect x="950.9" y="2037" width="0.2" height="15.0" fill="rgb(242,54,43)" rx="2" ry="2" />
+<text  x="953.88" y="2047.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (13 samples, 0.09%)</title><rect x="620.0" y="1989" width="1.1" height="15.0" fill="rgb(238,137,12)" rx="2" ry="2" />
+<text  x="623.05" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (35 samples, 0.25%)</title><rect x="489.3" y="2005" width="3.0" height="15.0" fill="rgb(229,51,47)" rx="2" ry="2" />
+<text  x="492.34" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::utf8_to_utf32[abi:cxx11] (3 samples, 0.02%)</title><rect x="283.1" y="2005" width="0.3" height="15.0" fill="rgb(220,215,18)" rx="2" ry="2" />
+<text  x="286.11" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1493" width="0.6" height="15.0" fill="rgb(220,30,19)" rx="2" ry="2" />
+<text  x="221.27" y="1503.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::MathOperatorContext::~MathOperatorContext (4 samples, 0.03%)</title><rect x="955.1" y="2037" width="0.4" height="15.0" fill="rgb(220,168,24)" rx="2" ry="2" />
+<text  x="958.12" y="2047.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (8 samples, 0.06%)</title><rect x="1038.4" y="2037" width="0.6" height="15.0" fill="rgb(217,155,22)" rx="2" ry="2" />
+<text  x="1041.36" y="2047.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="284.1" y="1925" width="0.4" height="15.0" fill="rgb(215,165,46)" rx="2" ry="2" />
+<text  x="287.13" y="1935.5" ></text>
+</g>
+<g >
+<title>cfree (2 samples, 0.01%)</title><rect x="1060.2" y="1973" width="0.2" height="15.0" fill="rgb(252,4,9)" rx="2" ry="2" />
+<text  x="1063.23" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="229" width="0.6" height="15.0" fill="rgb(213,182,9)" rx="2" ry="2" />
+<text  x="221.27" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.10%)</title><rect x="564.4" y="2021" width="1.2" height="15.0" fill="rgb(209,193,48)" rx="2" ry="2" />
+<text  x="567.44" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="1040.6" y="2021" width="0.6" height="15.0" fill="rgb(252,67,39)" rx="2" ry="2" />
+<text  x="1043.56" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.09%)</title><rect x="715.4" y="1989" width="1.0" height="15.0" fill="rgb(218,136,41)" rx="2" ry="2" />
+<text  x="718.41" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1285" width="0.6" height="15.0" fill="rgb(222,134,35)" rx="2" ry="2" />
+<text  x="221.27" y="1295.5" ></text>
+</g>
+<g >
+<title>[benchmark] (2 samples, 0.01%)</title><rect x="216.2" y="2005" width="0.2" height="15.0" fill="rgb(231,220,8)" rx="2" ry="2" />
+<text  x="219.23" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="952.8" y="2021" width="0.4" height="15.0" fill="rgb(209,177,10)" rx="2" ry="2" />
+<text  x="955.83" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::ConsoleErrorListener::~ConsoleErrorListener (6 samples, 0.04%)</title><rect x="533.8" y="2037" width="0.5" height="15.0" fill="rgb(216,96,15)" rx="2" ry="2" />
+<text  x="536.76" y="2047.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_lock (542 samples, 3.89%)</title><rect x="724.1" y="2005" width="45.9" height="15.0" fill="rgb(225,58,39)" rx="2" ry="2" />
+<text  x="727.05" y="2015.5" >__pt..</text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="517" width="0.6" height="15.0" fill="rgb(211,188,28)" rx="2" ry="2" />
+<text  x="221.27" y="527.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::index (3 samples, 0.02%)</title><rect x="585.0" y="1989" width="0.3" height="15.0" fill="rgb(225,163,7)" rx="2" ry="2" />
+<text  x="588.04" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="85" width="0.6" height="15.0" fill="rgb(219,115,7)" rx="2" ry="2" />
+<text  x="221.27" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="951.1" y="2021" width="0.4" height="15.0" fill="rgb(239,100,33)" rx="2" ry="2" />
+<text  x="954.13" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::getATN (2 samples, 0.01%)</title><rect x="1029.1" y="2005" width="0.2" height="15.0" fill="rgb(237,43,14)" rx="2" ry="2" />
+<text  x="1032.12" y="2015.5" ></text>
+</g>
+<g >
+<title>BM_ParseBenchmark (10 samples, 0.07%)</title><rect x="473.7" y="1989" width="0.8" height="15.0" fill="rgb(226,67,12)" rx="2" ry="2" />
+<text  x="476.66" y="1999.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt;, std::allocator&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt; &gt; &gt;::_M_realloc_insert&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt; &gt; (27 samples, 0.19%)</title><rect x="1057.9" y="2037" width="2.2" height="15.0" fill="rgb(232,156,14)" rx="2" ry="2" />
+<text  x="1060.85" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1509" width="0.6" height="15.0" fill="rgb(206,86,4)" rx="2" ry="2" />
+<text  x="221.27" y="1519.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::ParserRuleContext (9 samples, 0.06%)</title><rect x="994.4" y="2005" width="0.7" height="15.0" fill="rgb(243,163,21)" rx="2" ry="2" />
+<text  x="997.36" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::functionCall (8 samples, 0.06%)</title><rect x="1028.4" y="2005" width="0.7" height="15.0" fill="rgb(218,83,53)" rx="2" ry="2" />
+<text  x="1031.44" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::evalSemanticContext (8 samples, 0.06%)</title><rect x="606.3" y="2037" width="0.7" height="15.0" fill="rgb(248,117,35)" rx="2" ry="2" />
+<text  x="609.31" y="2047.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (2 samples, 0.01%)</title><rect x="329.1" y="2005" width="0.2" height="15.0" fill="rgb(211,60,28)" rx="2" ry="2" />
+<text  x="332.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (36 samples, 0.26%)</title><rect x="960.1" y="2005" width="3.1" height="15.0" fill="rgb(221,150,25)" rx="2" ry="2" />
+<text  x="963.12" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getChannel (22 samples, 0.16%)</title><rect x="494.0" y="2005" width="1.9" height="15.0" fill="rgb(212,95,43)" rx="2" ry="2" />
+<text  x="497.00" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1941" width="0.9" height="15.0" fill="rgb(248,127,6)" rx="2" ry="2" />
+<text  x="221.18" y="1951.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (5 samples, 0.04%)</title><rect x="1056.7" y="2037" width="0.4" height="15.0" fill="rgb(221,32,11)" rx="2" ry="2" />
+<text  x="1059.67" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="773" width="0.6" height="15.0" fill="rgb(212,108,40)" rx="2" ry="2" />
+<text  x="221.27" y="783.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::nextToken (14 samples, 0.10%)</title><rect x="1140.8" y="2053" width="1.1" height="15.0" fill="rgb(213,106,42)" rx="2" ry="2" />
+<text  x="1143.75" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="956.6" y="2005" width="0.6" height="15.0" fill="rgb(234,11,27)" rx="2" ry="2" />
+<text  x="959.56" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="213" width="0.6" height="15.0" fill="rgb(246,74,25)" rx="2" ry="2" />
+<text  x="221.27" y="223.5" ></text>
+</g>
+<g >
+<title>malloc (8 samples, 0.06%)</title><rect x="709.9" y="2005" width="0.7" height="15.0" fill="rgb(228,51,28)" rx="2" ry="2" />
+<text  x="712.90" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::LT (2 samples, 0.01%)</title><rect x="954.1" y="2005" width="0.2" height="15.0" fill="rgb(254,43,42)" rx="2" ry="2" />
+<text  x="957.10" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;parsers::MySqlParser::simpleId (4 samples, 0.03%)</title><rect x="1034.7" y="2005" width="0.4" height="15.0" fill="rgb(220,190,50)" rx="2" ry="2" />
+<text  x="1037.71" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="507.9" y="2021" width="0.2" height="15.0" fill="rgb(225,148,17)" rx="2" ry="2" />
+<text  x="510.90" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getType (10 samples, 0.07%)</title><rect x="1139.0" y="2053" width="0.8" height="15.0" fill="rgb(232,214,45)" rx="2" ry="2" />
+<text  x="1141.97" y="2063.5" ></text>
+</g>
+<g >
+<title>cfree (32 samples, 0.23%)</title><rect x="469.3" y="2005" width="2.7" height="15.0" fill="rgb(205,150,12)" rx="2" ry="2" />
+<text  x="472.34" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="1056.2" y="1957" width="0.1" height="15.0" fill="rgb(253,61,6)" rx="2" ry="2" />
+<text  x="1059.16" y="1967.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getType (15 samples, 0.11%)</title><rect x="495.9" y="2005" width="1.2" height="15.0" fill="rgb(223,42,39)" rx="2" ry="2" />
+<text  x="498.87" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::dfa::DFAState::~DFAState (2,332 samples, 16.75%)</title><rect x="716.8" y="2037" width="197.7" height="15.0" fill="rgb(206,60,25)" rx="2" ry="2" />
+<text  x="719.85" y="2047.5" >antlr4::dfa::DFAState::~D..</text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (12 samples, 0.09%)</title><rect x="560.4" y="2005" width="1.0" height="15.0" fill="rgb(245,97,34)" rx="2" ry="2" />
+<text  x="563.37" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (56 samples, 0.40%)</title><rect x="217.7" y="2005" width="4.7" height="15.0" fill="rgb(228,7,54)" rx="2" ry="2" />
+<text  x="220.67" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::TableSourcesContext::~TableSourcesContext (2 samples, 0.01%)</title><rect x="328.0" y="2021" width="0.2" height="15.0" fill="rgb(231,217,21)" rx="2" ry="2" />
+<text  x="331.03" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::lazyInit (23 samples, 0.17%)</title><rect x="514.3" y="2005" width="2.0" height="15.0" fill="rgb(232,13,15)" rx="2" ry="2" />
+<text  x="517.35" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readUnlock (8 samples, 0.06%)</title><rect x="694.4" y="1989" width="0.7" height="15.0" fill="rgb(220,39,45)" rx="2" ry="2" />
+<text  x="697.38" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="716.4" y="2005" width="0.4" height="15.0" fill="rgb(208,88,52)" rx="2" ry="2" />
+<text  x="719.42" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="149" width="0.6" height="15.0" fill="rgb(246,173,41)" rx="2" ry="2" />
+<text  x="221.27" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="821" width="0.6" height="15.0" fill="rgb(238,200,22)" rx="2" ry="2" />
+<text  x="221.27" y="831.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::TerminalNodeImpl::setParent (18 samples, 0.13%)</title><rect x="922.7" y="2037" width="1.5" height="15.0" fill="rgb(206,52,12)" rx="2" ry="2" />
+<text  x="925.65" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="981" width="0.6" height="15.0" fill="rgb(227,213,18)" rx="2" ry="2" />
+<text  x="221.27" y="991.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (6 samples, 0.04%)</title><rect x="615.3" y="1973" width="0.5" height="15.0" fill="rgb(245,72,39)" rx="2" ry="2" />
+<text  x="618.30" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="953.8" y="1989" width="0.2" height="15.0" fill="rgb(254,111,6)" rx="2" ry="2" />
+<text  x="956.85" y="1999.5" ></text>
+</g>
+<g >
+<title>setup_new_exec (4 samples, 0.03%)</title><rect x="1189.7" y="1941" width="0.3" height="15.0" fill="rgb(232,124,34)" rx="2" ry="2" />
+<text  x="1192.66" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1237" width="0.6" height="15.0" fill="rgb(252,43,23)" rx="2" ry="2" />
+<text  x="221.27" y="1247.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (3 samples, 0.02%)</title><rect x="1055.4" y="2005" width="0.2" height="15.0" fill="rgb(231,6,35)" rx="2" ry="2" />
+<text  x="1058.39" y="2015.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.01%)</title><rect x="280.8" y="2005" width="0.2" height="15.0" fill="rgb(228,78,21)" rx="2" ry="2" />
+<text  x="283.82" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="581" width="0.6" height="15.0" fill="rgb(224,154,42)" rx="2" ry="2" />
+<text  x="221.27" y="591.5" ></text>
+</g>
+<g >
+<title>operator new (6 samples, 0.04%)</title><rect x="321.2" y="2021" width="0.5" height="15.0" fill="rgb(214,124,42)" rx="2" ry="2" />
+<text  x="324.17" y="2031.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (2 samples, 0.01%)</title><rect x="953.5" y="1973" width="0.2" height="15.0" fill="rgb(246,71,23)" rx="2" ry="2" />
+<text  x="956.51" y="1983.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::BufferedTokenStream (2 samples, 0.01%)</title><rect x="1132.4" y="2053" width="0.1" height="15.0" fill="rgb(228,169,21)" rx="2" ry="2" />
+<text  x="1135.36" y="2063.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ATNConfig::~ATNConfig (14 samples, 0.10%)</title><rect x="564.4" y="2037" width="1.2" height="15.0" fill="rgb(231,100,21)" rx="2" ry="2" />
+<text  x="567.44" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::unrollRecursionContexts (2 samples, 0.01%)</title><rect x="956.1" y="2005" width="0.1" height="15.0" fill="rgb(233,20,23)" rx="2" ry="2" />
+<text  x="959.05" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::comparisonOperator (3 samples, 0.02%)</title><rect x="1023.2" y="2005" width="0.2" height="15.0" fill="rgb(230,41,27)" rx="2" ry="2" />
+<text  x="1026.18" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (6 samples, 0.04%)</title><rect x="715.9" y="1973" width="0.5" height="15.0" fill="rgb(212,160,7)" rx="2" ry="2" />
+<text  x="718.91" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::PredicateContext::~PredicateContext (6 samples, 0.04%)</title><rect x="326.2" y="2021" width="0.5" height="15.0" fill="rgb(210,197,5)" rx="2" ry="2" />
+<text  x="329.17" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="725" width="0.6" height="15.0" fill="rgb(209,67,6)" rx="2" ry="2" />
+<text  x="221.27" y="735.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="181" width="0.6" height="15.0" fill="rgb(253,7,51)" rx="2" ry="2" />
+<text  x="221.27" y="191.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::unrollRecursionContexts (2 samples, 0.01%)</title><rect x="952.4" y="2005" width="0.2" height="15.0" fill="rgb(246,207,37)" rx="2" ry="2" />
+<text  x="955.41" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::getNumberOfOnChannelTokens (29 samples, 0.21%)</title><rect x="497.8" y="2005" width="2.5" height="15.0" fill="rgb(221,109,47)" rx="2" ry="2" />
+<text  x="500.82" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (4 samples, 0.03%)</title><rect x="225.1" y="2005" width="0.4" height="15.0" fill="rgb(243,117,23)" rx="2" ry="2" />
+<text  x="228.13" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::uid (12 samples, 0.09%)</title><rect x="1033.4" y="2005" width="1.1" height="15.0" fill="rgb(228,111,43)" rx="2" ry="2" />
+<text  x="1036.44" y="2015.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="769.7" y="1893" width="0.3" height="15.0" fill="rgb(243,204,12)" rx="2" ry="2" />
+<text  x="772.66" y="1903.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="769.7" y="1941" width="0.3" height="15.0" fill="rgb(250,169,45)" rx="2" ry="2" />
+<text  x="772.66" y="1951.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to antlr4::Lexer::nextToken (12 samples, 0.09%)</title><rect x="1184.1" y="2053" width="1.0" height="15.0" fill="rgb(242,201,43)" rx="2" ry="2" />
+<text  x="1187.07" y="2063.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="284.1" y="1877" width="0.4" height="15.0" fill="rgb(249,228,42)" rx="2" ry="2" />
+<text  x="287.13" y="1887.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1605" width="0.8" height="15.0" fill="rgb(247,192,3)" rx="2" ry="2" />
+<text  x="221.18" y="1615.5" ></text>
+</g>
+<g >
+<title>antlr4::WritableToken::~WritableToken (7 samples, 0.05%)</title><rect x="500.3" y="2005" width="0.6" height="15.0" fill="rgb(207,169,45)" rx="2" ry="2" />
+<text  x="503.28" y="2015.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (2 samples, 0.01%)</title><rect x="280.8" y="1989" width="0.2" height="15.0" fill="rgb(238,65,46)" rx="2" ry="2" />
+<text  x="283.82" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::WritableToken::~WritableToken (2 samples, 0.01%)</title><rect x="291.2" y="2021" width="0.1" height="15.0" fill="rgb(222,87,19)" rx="2" ry="2" />
+<text  x="294.16" y="2031.5" ></text>
+</g>
+<g >
+<title>operator delete (10 samples, 0.07%)</title><rect x="472.0" y="2005" width="0.9" height="15.0" fill="rgb(227,154,53)" rx="2" ry="2" />
+<text  x="475.05" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FunctionArgsContext::~FunctionArgsContext (3 samples, 0.02%)</title><rect x="325.0" y="2021" width="0.2" height="15.0" fill="rgb(252,213,33)" rx="2" ry="2" />
+<text  x="327.98" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::expression (10 samples, 0.07%)</title><rect x="1024.8" y="2005" width="0.8" height="15.0" fill="rgb(243,71,36)" rx="2" ry="2" />
+<text  x="1027.79" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (1,193 samples, 8.57%)</title><rect x="64.6" y="2053" width="101.1" height="15.0" fill="rgb(246,125,37)" rx="2" ry="2" />
+<text  x="67.59" y="2063.5" >[libc-2.30.so]</text>
+</g>
+<g >
+<title>malloc (16 samples, 0.11%)</title><rect x="556.3" y="2021" width="1.4" height="15.0" fill="rgb(222,182,50)" rx="2" ry="2" />
+<text  x="559.30" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::adjustSeekIndex (2 samples, 0.01%)</title><rect x="1140.2" y="2053" width="0.2" height="15.0" fill="rgb(251,44,13)" rx="2" ry="2" />
+<text  x="1143.24" y="2063.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (11 samples, 0.08%)</title><rect x="1005.9" y="2005" width="0.9" height="15.0" fill="rgb(216,192,45)" rx="2" ry="2" />
+<text  x="1008.89" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::TerminalNode::~TerminalNode (5 samples, 0.04%)</title><rect x="923.2" y="2005" width="0.4" height="15.0" fill="rgb(208,85,52)" rx="2" ry="2" />
+<text  x="926.16" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt;, std::pair&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; const, std::unordered_map&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt;, std::shared_ptr&lt;antlr4::atn::PredictionContext&gt;, antlr4::atn::PredictionContextHasher, antlr4::atn::PredictionContextComparer, std::allocator&lt;std::pair&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; const, std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; &gt; &gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; const, std::unordered_map&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt;, std::shared_ptr&lt;antlr4::atn::PredictionContext&gt;, antlr4::atn::PredictionContextHasher, antlr4::atn::PredictionContextComparer, std::allocator&lt;std::pair&lt;std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; const, std::shared_ptr&lt;antlr4::atn::PredictionContext&gt; &gt; &gt; &gt; &gt; &gt;, std::__detail::_Select1st, antlr4::atn::PredictionContextComparer, antlr4::atn::PredictionContextHasher, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;true, false, true&gt; &gt;::~_Hashtable (3 samples, 0.02%)</title><rect x="714.7" y="2005" width="0.3" height="15.0" fill="rgb(229,87,8)" rx="2" ry="2" />
+<text  x="717.73" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (293 samples, 2.10%)</title><rect x="508.9" y="2021" width="24.9" height="15.0" fill="rgb(214,42,11)" rx="2" ry="2" />
+<text  x="511.92" y="2031.5" >[..</text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::CommonTokenStream (2 samples, 0.01%)</title><rect x="222.8" y="2005" width="0.1" height="15.0" fill="rgb(215,129,3)" rx="2" ry="2" />
+<text  x="225.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1413" width="0.6" height="15.0" fill="rgb(206,154,19)" rx="2" ry="2" />
+<text  x="221.27" y="1423.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::seek (5 samples, 0.04%)</title><rect x="585.3" y="1989" width="0.4" height="15.0" fill="rgb(244,36,2)" rx="2" ry="2" />
+<text  x="588.29" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (911 samples, 6.54%)</title><rect x="960.1" y="2021" width="77.2" height="15.0" fill="rgb(223,105,27)" rx="2" ry="2" />
+<text  x="963.12" y="2031.5" >[unknown]</text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (26 samples, 0.19%)</title><rect x="544.4" y="2021" width="2.2" height="15.0" fill="rgb(218,181,12)" rx="2" ry="2" />
+<text  x="547.35" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (110 samples, 0.79%)</title><rect x="216.2" y="2021" width="9.4" height="15.0" fill="rgb(250,220,35)" rx="2" ry="2" />
+<text  x="219.23" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::~ParserATNSimulator (1,274 samples, 9.15%)</title><rect x="607.0" y="2037" width="108.0" height="15.0" fill="rgb(253,148,18)" rx="2" ry="2" />
+<text  x="609.99" y="2047.5" >antlr4::atn::..</text>
+</g>
+<g >
+<title>antlr4::Parser::getPrecedence (3 samples, 0.02%)</title><rect x="622.8" y="2005" width="0.2" height="15.0" fill="rgb(234,43,32)" rx="2" ry="2" />
+<text  x="625.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1685" width="0.8" height="15.0" fill="rgb(253,201,16)" rx="2" ry="2" />
+<text  x="221.18" y="1695.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (3 samples, 0.02%)</title><rect x="1056.3" y="1973" width="0.3" height="15.0" fill="rgb(210,38,41)" rx="2" ry="2" />
+<text  x="1059.33" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="197" width="0.6" height="15.0" fill="rgb(230,42,48)" rx="2" ry="2" />
+<text  x="221.27" y="207.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::LA (128 samples, 0.92%)</title><rect x="770.0" y="2005" width="10.8" height="15.0" fill="rgb(253,178,45)" rx="2" ry="2" />
+<text  x="772.99" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Token::~Token (9 samples, 0.06%)</title><rect x="290.3" y="2021" width="0.8" height="15.0" fill="rgb(250,173,51)" rx="2" ry="2" />
+<text  x="293.31" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::mark (5 samples, 0.04%)</title><rect x="621.7" y="2005" width="0.4" height="15.0" fill="rgb(254,4,23)" rx="2" ry="2" />
+<text  x="624.66" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="1039.6" y="1989" width="0.2" height="15.0" fill="rgb(218,170,12)" rx="2" ry="2" />
+<text  x="1042.63" y="1999.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::Lexer::nextToken (6 samples, 0.04%)</title><rect x="1144.7" y="2005" width="0.5" height="15.0" fill="rgb(250,188,23)" rx="2" ry="2" />
+<text  x="1147.74" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::execATN (3 samples, 0.02%)</title><rect x="696.5" y="2005" width="0.3" height="15.0" fill="rgb(228,200,40)" rx="2" ry="2" />
+<text  x="699.50" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="221.1" y="1989" width="0.2" height="15.0" fill="rgb(212,153,19)" rx="2" ry="2" />
+<text  x="224.15" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="533" width="0.6" height="15.0" fill="rgb(249,198,7)" rx="2" ry="2" />
+<text  x="221.27" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="437" width="0.6" height="15.0" fill="rgb(245,129,42)" rx="2" ry="2" />
+<text  x="221.27" y="447.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readLock (2 samples, 0.01%)</title><rect x="508.8" y="2021" width="0.1" height="15.0" fill="rgb(250,182,39)" rx="2" ry="2" />
+<text  x="511.75" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.2" y="2021" width="0.2" height="15.0" fill="rgb(228,23,20)" rx="2" ry="2" />
+<text  x="962.19" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="564.0" y="2021" width="0.4" height="15.0" fill="rgb(245,122,19)" rx="2" ry="2" />
+<text  x="567.02" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::unrollRecursionContexts (3 samples, 0.02%)</title><rect x="994.0" y="2005" width="0.3" height="15.0" fill="rgb(220,123,16)" rx="2" ry="2" />
+<text  x="997.03" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::AggregateWindowedFunctionContext::~AggregateWindowedFunctionContext (2 samples, 0.01%)</title><rect x="321.9" y="2021" width="0.2" height="15.0" fill="rgb(227,30,41)" rx="2" ry="2" />
+<text  x="324.93" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FunctionCallContext::FunctionCallContext (2 samples, 0.01%)</title><rect x="1020.9" y="2005" width="0.2" height="15.0" fill="rgb(236,1,43)" rx="2" ry="2" />
+<text  x="1023.90" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (7 samples, 0.05%)</title><rect x="216.7" y="2005" width="0.6" height="15.0" fill="rgb(214,151,32)" rx="2" ry="2" />
+<text  x="219.74" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::createTerminalNode (5 samples, 0.04%)</title><rect x="922.7" y="2005" width="0.5" height="15.0" fill="rgb(245,153,27)" rx="2" ry="2" />
+<text  x="925.74" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="325" width="0.6" height="15.0" fill="rgb(223,20,36)" rx="2" ry="2" />
+<text  x="221.27" y="335.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (3 samples, 0.02%)</title><rect x="613.4" y="1989" width="0.3" height="15.0" fill="rgb(251,1,4)" rx="2" ry="2" />
+<text  x="616.44" y="1999.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="1189.7" y="1877" width="0.3" height="15.0" fill="rgb(232,12,27)" rx="2" ry="2" />
+<text  x="1192.66" y="1887.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (19 samples, 0.14%)</title><rect x="63.0" y="2053" width="1.6" height="15.0" fill="rgb(218,206,26)" rx="2" ry="2" />
+<text  x="65.98" y="2063.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (16 samples, 0.11%)</title><rect x="1035.9" y="2005" width="1.4" height="15.0" fill="rgb(209,206,40)" rx="2" ry="2" />
+<text  x="1038.90" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::atn::LexerChannelAction, std::allocator&lt;antlr4::atn::LexerChannelAction&gt;,  (170 samples, 1.22%)</title><rect x="1041.2" y="2037" width="14.4" height="15.0" fill="rgb(242,95,20)" rx="2" ry="2" />
+<text  x="1044.24" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1477" width="0.6" height="15.0" fill="rgb(224,148,51)" rx="2" ry="2" />
+<text  x="221.27" y="1487.5" ></text>
+</g>
+<g >
+<title>__x64_sys_execve (4 samples, 0.03%)</title><rect x="1189.7" y="2005" width="0.3" height="15.0" fill="rgb(210,216,46)" rx="2" ry="2" />
+<text  x="1192.66" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::load (42 samples, 0.30%)</title><rect x="281.2" y="2021" width="3.6" height="15.0" fill="rgb(235,26,37)" rx="2" ry="2" />
+<text  x="284.24" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::SemanticContext::Predicate::~Predicate (12 samples, 0.09%)</title><rect x="715.4" y="2037" width="1.0" height="15.0" fill="rgb(207,206,46)" rx="2" ry="2" />
+<text  x="718.41" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="549" width="0.6" height="15.0" fill="rgb(237,119,54)" rx="2" ry="2" />
+<text  x="221.27" y="559.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (2 samples, 0.01%)</title><rect x="328.6" y="2021" width="0.2" height="15.0" fill="rgb(252,14,30)" rx="2" ry="2" />
+<text  x="331.63" y="2031.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="615.0" y="1973" width="0.3" height="15.0" fill="rgb(237,220,7)" rx="2" ry="2" />
+<text  x="617.96" y="1983.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="606.7" y="1909" width="0.3" height="15.0" fill="rgb(228,200,28)" rx="2" ry="2" />
+<text  x="609.65" y="1919.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::PredictionContextMergeCache::clear (15 samples, 0.11%)</title><rect x="696.8" y="2005" width="1.2" height="15.0" fill="rgb(232,107,10)" rx="2" ry="2" />
+<text  x="699.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1925" width="0.9" height="15.0" fill="rgb(231,176,0)" rx="2" ry="2" />
+<text  x="221.18" y="1935.5" ></text>
+</g>
+<g >
+<title>antlr4::Recognizer::setState (8 samples, 0.06%)</title><rect x="997.1" y="2005" width="0.7" height="15.0" fill="rgb(210,110,24)" rx="2" ry="2" />
+<text  x="1000.08" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::SingletonPredictionContext::getParent (5 samples, 0.04%)</title><rect x="716.4" y="2037" width="0.4" height="15.0" fill="rgb(245,149,21)" rx="2" ry="2" />
+<text  x="719.42" y="2047.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="606.7" y="1957" width="0.3" height="15.0" fill="rgb(246,219,16)" rx="2" ry="2" />
+<text  x="609.65" y="1967.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 0.03%)</title><rect x="1189.7" y="2021" width="0.3" height="15.0" fill="rgb(248,150,3)" rx="2" ry="2" />
+<text  x="1192.66" y="2031.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (4 samples, 0.03%)</title><rect x="1040.1" y="1989" width="0.3" height="15.0" fill="rgb(213,198,16)" rx="2" ry="2" />
+<text  x="1043.05" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::setCharPositionInLine (32 samples, 0.23%)</title><rect x="546.6" y="2021" width="2.7" height="15.0" fill="rgb(228,129,49)" rx="2" ry="2" />
+<text  x="549.56" y="2031.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="606.7" y="1989" width="0.3" height="15.0" fill="rgb(239,207,40)" rx="2" ry="2" />
+<text  x="609.65" y="1999.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (7 samples, 0.05%)</title><rect x="224.4" y="2005" width="0.6" height="15.0" fill="rgb(213,207,6)" rx="2" ry="2" />
+<text  x="227.37" y="2015.5" ></text>
+</g>
+<g >
+<title>operator new (10 samples, 0.07%)</title><rect x="619.2" y="1989" width="0.8" height="15.0" fill="rgb(232,84,24)" rx="2" ry="2" />
+<text  x="622.20" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="1039.5" y="2005" width="1.0" height="15.0" fill="rgb(236,160,33)" rx="2" ry="2" />
+<text  x="1042.54" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::DecimalLiteralContext::~DecimalLiteralContext (6 samples, 0.04%)</title><rect x="951.5" y="2037" width="0.5" height="15.0" fill="rgb(235,226,46)" rx="2" ry="2" />
+<text  x="954.47" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (47 samples, 0.34%)</title><rect x="614.0" y="1989" width="4.0" height="15.0" fill="rgb(223,91,27)" rx="2" ry="2" />
+<text  x="617.03" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::failOrAccept (2 samples, 0.01%)</title><rect x="576.1" y="2005" width="0.1" height="15.0" fill="rgb(252,195,50)" rx="2" ry="2" />
+<text  x="579.05" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (3 samples, 0.02%)</title><rect x="474.5" y="1989" width="0.3" height="15.0" fill="rgb(242,206,24)" rx="2" ry="2" />
+<text  x="477.51" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::ParseTree::ParseTree (9 samples, 0.06%)</title><rect x="1143.6" y="2053" width="0.8" height="15.0" fill="rgb(217,10,8)" rx="2" ry="2" />
+<text  x="1146.63" y="2063.5" ></text>
+</g>
+<g >
+<title>operator delete (11 samples, 0.08%)</title><rect x="320.2" y="2021" width="1.0" height="15.0" fill="rgb(215,34,21)" rx="2" ry="2" />
+<text  x="323.24" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="949" width="0.6" height="15.0" fill="rgb(209,69,29)" rx="2" ry="2" />
+<text  x="221.27" y="959.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char32_t, std::char_traits&lt;char32_t&gt;, std::allocator&lt;char32_t&gt; &gt;::resize (3 samples, 0.02%)</title><rect x="284.5" y="2005" width="0.2" height="15.0" fill="rgb(206,214,4)" rx="2" ry="2" />
+<text  x="287.47" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::contains (95 samples, 0.68%)</title><rect x="1006.8" y="2005" width="8.1" height="15.0" fill="rgb(217,3,19)" rx="2" ry="2" />
+<text  x="1009.82" y="2015.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (9 samples, 0.06%)</title><rect x="543.6" y="2021" width="0.8" height="15.0" fill="rgb(205,144,40)" rx="2" ry="2" />
+<text  x="546.59" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="566.0" y="2005" width="0.1" height="15.0" fill="rgb(248,187,43)" rx="2" ry="2" />
+<text  x="568.97" y="2015.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="606.7" y="1861" width="0.3" height="15.0" fill="rgb(254,215,21)" rx="2" ry="2" />
+<text  x="609.65" y="1871.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SimpleSelectContext::~SimpleSelectContext (3 samples, 0.02%)</title><rect x="958.9" y="2037" width="0.3" height="15.0" fill="rgb(248,0,20)" rx="2" ry="2" />
+<text  x="961.93" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1109" width="0.6" height="15.0" fill="rgb(245,69,5)" rx="2" ry="2" />
+<text  x="221.27" y="1119.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::EmptyStatementContext::~EmptyStatementContext (2 samples, 0.01%)</title><rect x="323.4" y="2021" width="0.1" height="15.0" fill="rgb(243,149,17)" rx="2" ry="2" />
+<text  x="326.37" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1733" width="0.8" height="15.0" fill="rgb(226,64,43)" rx="2" ry="2" />
+<text  x="221.18" y="1743.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (18 samples, 0.13%)</title><rect x="539.4" y="2021" width="1.6" height="15.0" fill="rgb(240,215,8)" rx="2" ry="2" />
+<text  x="542.44" y="2031.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (9 samples, 0.06%)</title><rect x="223.3" y="2005" width="0.7" height="15.0" fill="rgb(232,229,9)" rx="2" ry="2" />
+<text  x="226.27" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::DefaultErrorStrategy::sync (117 samples, 0.84%)</title><rect x="977.2" y="2005" width="10.0" height="15.0" fill="rgb(205,17,53)" rx="2" ry="2" />
+<text  x="980.24" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::nextToken (3 samples, 0.02%)</title><rect x="1144.4" y="2005" width="0.3" height="15.0" fill="rgb(220,40,23)" rx="2" ry="2" />
+<text  x="1147.40" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readUnlock (262 samples, 1.88%)</title><rect x="924.2" y="2037" width="22.2" height="15.0" fill="rgb(211,137,5)" rx="2" ry="2" />
+<text  x="927.18" y="2047.5" >a..</text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::nextTokenOnChannel (3 samples, 0.02%)</title><rect x="975.4" y="2005" width="0.2" height="15.0" fill="rgb(238,27,19)" rx="2" ry="2" />
+<text  x="978.38" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1365" width="0.6" height="15.0" fill="rgb(244,15,48)" rx="2" ry="2" />
+<text  x="221.27" y="1375.5" ></text>
+</g>
+<g >
+<title>cfree (2 samples, 0.01%)</title><rect x="224.0" y="2005" width="0.2" height="15.0" fill="rgb(232,155,37)" rx="2" ry="2" />
+<text  x="227.03" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1541" width="0.6" height="15.0" fill="rgb(246,123,48)" rx="2" ry="2" />
+<text  x="221.27" y="1551.5" ></text>
+</g>
+<g >
+<title>operator new (12 samples, 0.09%)</title><rect x="1018.9" y="2005" width="1.1" height="15.0" fill="rgb(225,143,40)" rx="2" ry="2" />
+<text  x="1021.95" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FromClauseContext::~FromClauseContext (2 samples, 0.01%)</title><rect x="952.7" y="2037" width="0.1" height="15.0" fill="rgb(228,63,22)" rx="2" ry="2" />
+<text  x="955.66" y="2047.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (5 samples, 0.04%)</title><rect x="207.7" y="2037" width="0.4" height="15.0" fill="rgb(240,178,14)" rx="2" ry="2" />
+<text  x="210.67" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (2,332 samples, 16.75%)</title><rect x="716.8" y="2021" width="197.7" height="15.0" fill="rgb(212,214,21)" rx="2" ry="2" />
+<text  x="719.85" y="2031.5" >[unknown]</text>
+</g>
+<g >
+<title>antlr4::Parser::enterRecursionRule (7 samples, 0.05%)</title><rect x="989.9" y="2005" width="0.6" height="15.0" fill="rgb(251,58,5)" rx="2" ry="2" />
+<text  x="992.87" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.12%)</title><rect x="604.9" y="2021" width="1.4" height="15.0" fill="rgb(254,133,20)" rx="2" ry="2" />
+<text  x="607.87" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::~ParserRuleContext (39 samples, 0.28%)</title><rect x="560.4" y="2037" width="3.3" height="15.0" fill="rgb(247,195,54)" rx="2" ry="2" />
+<text  x="563.37" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::tableSourceItem (2 samples, 0.01%)</title><rect x="1033.3" y="2005" width="0.1" height="15.0" fill="rgb(229,32,34)" rx="2" ry="2" />
+<text  x="1036.27" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::fetch (17 samples, 0.12%)</title><rect x="1133.0" y="2053" width="1.5" height="15.0" fill="rgb(219,62,32)" rx="2" ry="2" />
+<text  x="1136.04" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1877" width="0.9" height="15.0" fill="rgb(236,71,41)" rx="2" ry="2" />
+<text  x="221.18" y="1887.5" ></text>
+</g>
+<g >
+<title>__do_execve_file.isra.0 (4 samples, 0.03%)</title><rect x="1189.7" y="1989" width="0.3" height="15.0" fill="rgb(224,12,42)" rx="2" ry="2" />
+<text  x="1192.66" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::computeTargetState (2 samples, 0.01%)</title><rect x="789.8" y="2005" width="0.2" height="15.0" fill="rgb(228,164,48)" rx="2" ry="2" />
+<text  x="792.83" y="2015.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (4 samples, 0.03%)</title><rect x="606.7" y="2021" width="0.3" height="15.0" fill="rgb(214,127,40)" rx="2" ry="2" />
+<text  x="609.65" y="2031.5" ></text>
+</g>
+<g >
+<title>cfree (73 samples, 0.52%)</title><rect x="314.0" y="2021" width="6.2" height="15.0" fill="rgb(230,201,22)" rx="2" ry="2" />
+<text  x="317.05" y="2031.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to antlr4::Lexer::getLine (39 samples, 0.28%)</title><rect x="504.1" y="2005" width="3.3" height="15.0" fill="rgb(225,38,8)" rx="2" ry="2" />
+<text  x="507.09" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::LT (61 samples, 0.44%)</title><rect x="528.5" y="2005" width="5.2" height="15.0" fill="rgb(221,135,5)" rx="2" ry="2" />
+<text  x="531.50" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::emit (301 samples, 2.16%)</title><rect x="534.4" y="2037" width="25.5" height="15.0" fill="rgb(215,74,42)" rx="2" ry="2" />
+<text  x="537.35" y="2047.5" >a..</text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (2 samples, 0.01%)</title><rect x="220.0" y="1973" width="0.1" height="15.0" fill="rgb(239,156,10)" rx="2" ry="2" />
+<text  x="222.96" y="1983.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::match (284 samples, 2.04%)</title><rect x="576.2" y="2005" width="24.1" height="15.0" fill="rgb(224,228,42)" rx="2" ry="2" />
+<text  x="579.22" y="2015.5" >a..</text>
+</g>
+<g >
+<title>std::condition_variable::notify_one (40 samples, 0.29%)</title><rect x="911.1" y="2005" width="3.4" height="15.0" fill="rgb(214,216,33)" rx="2" ry="2" />
+<text  x="914.13" y="2015.5" ></text>
+</g>
+<g >
+<title>cfree (28 samples, 0.20%)</title><rect x="1015.8" y="2005" width="2.4" height="15.0" fill="rgb(246,102,10)" rx="2" ry="2" />
+<text  x="1018.81" y="2015.5" ></text>
+</g>
+<g >
+<title>operator delete (4 samples, 0.03%)</title><rect x="1054.8" y="2005" width="0.3" height="15.0" fill="rgb(252,174,31)" rx="2" ry="2" />
+<text  x="1057.80" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="330.0" y="2005" width="0.2" height="15.0" fill="rgb(206,26,22)" rx="2" ry="2" />
+<text  x="332.98" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::~CommonToken (8 samples, 0.06%)</title><rect x="497.1" y="2005" width="0.7" height="15.0" fill="rgb(249,63,12)" rx="2" ry="2" />
+<text  x="500.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="645" width="0.6" height="15.0" fill="rgb(224,175,48)" rx="2" ry="2" />
+<text  x="221.27" y="655.5" ></text>
+</g>
+<g >
+<title>BM_TokenizeBenchmark (21 samples, 0.15%)</title><rect x="463.0" y="2005" width="1.8" height="15.0" fill="rgb(217,17,41)" rx="2" ry="2" />
+<text  x="465.98" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="661" width="0.6" height="15.0" fill="rgb(251,189,32)" rx="2" ry="2" />
+<text  x="221.27" y="671.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (14 samples, 0.10%)</title><rect x="713.5" y="2005" width="1.2" height="15.0" fill="rgb(210,47,0)" rx="2" ry="2" />
+<text  x="716.54" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::mathOperator (2 samples, 0.01%)</title><rect x="1029.7" y="2005" width="0.2" height="15.0" fill="rgb(244,193,36)" rx="2" ry="2" />
+<text  x="1032.71" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::enterOuterAlt (21 samples, 0.15%)</title><rect x="988.1" y="2005" width="1.8" height="15.0" fill="rgb(238,113,24)" rx="2" ry="2" />
+<text  x="991.09" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::~Parser (48 samples, 0.34%)</title><rect x="286.1" y="2021" width="4.0" height="15.0" fill="rgb(222,131,40)" rx="2" ry="2" />
+<text  x="289.08" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::functionArg (2 samples, 0.01%)</title><rect x="1028.0" y="2005" width="0.2" height="15.0" fill="rgb(237,44,28)" rx="2" ry="2" />
+<text  x="1031.02" y="2015.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="284.1" y="1957" width="0.4" height="15.0" fill="rgb(232,197,5)" rx="2" ry="2" />
+<text  x="287.13" y="1967.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::DefaultErrorStrategy, std::allocator&lt;antlr4::DefaultErrorStrategy&gt;,  (3 samples, 0.02%)</title><rect x="1039.3" y="2037" width="0.2" height="15.0" fill="rgb(222,119,29)" rx="2" ry="2" />
+<text  x="1042.29" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::ParseTree::ParseTree (3 samples, 0.02%)</title><rect x="501.3" y="2005" width="0.2" height="15.0" fill="rgb(231,85,17)" rx="2" ry="2" />
+<text  x="504.29" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::index (12 samples, 0.09%)</title><rect x="788.8" y="2005" width="1.0" height="15.0" fill="rgb(214,202,1)" rx="2" ry="2" />
+<text  x="791.81" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::consume (36 samples, 0.26%)</title><rect x="640.5" y="1989" width="3.0" height="15.0" fill="rgb(211,118,10)" rx="2" ry="2" />
+<text  x="643.47" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1829" width="0.9" height="15.0" fill="rgb(209,12,38)" rx="2" ry="2" />
+<text  x="221.18" y="1839.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::LA (15 samples, 0.11%)</title><rect x="973.3" y="2005" width="1.2" height="15.0" fill="rgb(214,224,47)" rx="2" ry="2" />
+<text  x="976.26" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::SimState::reset (8 samples, 0.06%)</title><rect x="573.6" y="2005" width="0.7" height="15.0" fill="rgb(238,171,34)" rx="2" ry="2" />
+<text  x="576.60" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::addChild (2 samples, 0.01%)</title><rect x="949.9" y="2005" width="0.2" height="15.0" fill="rgb(213,172,51)" rx="2" ry="2" />
+<text  x="952.95" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="885" width="0.6" height="15.0" fill="rgb(227,159,6)" rx="2" ry="2" />
+<text  x="221.27" y="895.5" ></text>
+</g>
+<g >
+<title>antlr4::Recognizer::~Recognizer (2 samples, 0.01%)</title><rect x="290.1" y="2021" width="0.2" height="15.0" fill="rgb(220,220,28)" rx="2" ry="2" />
+<text  x="293.15" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::selectStatement (6 samples, 0.04%)</title><rect x="1031.3" y="2005" width="0.5" height="15.0" fill="rgb(252,122,40)" rx="2" ry="2" />
+<text  x="1034.32" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1813" width="0.9" height="15.0" fill="rgb(213,180,15)" rx="2" ry="2" />
+<text  x="221.18" y="1823.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="284.1" y="1845" width="0.4" height="15.0" fill="rgb(252,42,40)" rx="2" ry="2" />
+<text  x="287.13" y="1855.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (10 samples, 0.07%)</title><rect x="963.2" y="2005" width="0.8" height="15.0" fill="rgb(254,188,9)" rx="2" ry="2" />
+<text  x="966.17" y="2015.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.01%)</title><rect x="952.8" y="1973" width="0.2" height="15.0" fill="rgb(230,227,52)" rx="2" ry="2" />
+<text  x="955.83" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="533.8" y="2021" width="0.5" height="15.0" fill="rgb(217,203,39)" rx="2" ry="2" />
+<text  x="536.76" y="2031.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_unlock (8 samples, 0.06%)</title><rect x="508.1" y="2021" width="0.7" height="15.0" fill="rgb(222,131,24)" rx="2" ry="2" />
+<text  x="511.07" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="165" width="0.6" height="15.0" fill="rgb(224,202,2)" rx="2" ry="2" />
+<text  x="221.27" y="175.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::exitRule (5 samples, 0.04%)</title><rect x="992.0" y="2005" width="0.4" height="15.0" fill="rgb(238,102,34)" rx="2" ry="2" />
+<text  x="994.99" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FunctionArgContext::~FunctionArgContext (3 samples, 0.02%)</title><rect x="954.0" y="2037" width="0.3" height="15.0" fill="rgb(244,224,39)" rx="2" ry="2" />
+<text  x="957.02" y="2047.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="284.1" y="1973" width="0.4" height="15.0" fill="rgb(218,46,47)" rx="2" ry="2" />
+<text  x="287.13" y="1983.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (2 samples, 0.01%)</title><rect x="225.0" y="2005" width="0.1" height="15.0" fill="rgb(229,125,45)" rx="2" ry="2" />
+<text  x="227.96" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (407 samples, 2.92%)</title><rect x="472.9" y="2021" width="34.5" height="15.0" fill="rgb(230,10,31)" rx="2" ry="2" />
+<text  x="475.90" y="2031.5" >[u..</text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1429" width="0.6" height="15.0" fill="rgb(229,222,20)" rx="2" ry="2" />
+<text  x="221.27" y="1439.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (7 samples, 0.05%)</title><rect x="567.1" y="1989" width="0.6" height="15.0" fill="rgb(225,152,4)" rx="2" ry="2" />
+<text  x="570.07" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="953.3" y="1989" width="0.4" height="15.0" fill="rgb(228,42,16)" rx="2" ry="2" />
+<text  x="956.25" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::previousTokenOnChannel (21 samples, 0.15%)</title><rect x="487.6" y="2005" width="1.7" height="15.0" fill="rgb(231,139,9)" rx="2" ry="2" />
+<text  x="490.56" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::InitializeInstanceFields (20 samples, 0.14%)</title><rect x="492.3" y="2005" width="1.7" height="15.0" fill="rgb(218,71,27)" rx="2" ry="2" />
+<text  x="495.31" y="2015.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_lock (105 samples, 0.75%)</title><rect x="630.7" y="1989" width="8.9" height="15.0" fill="rgb(219,81,1)" rx="2" ry="2" />
+<text  x="633.73" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1045" width="0.6" height="15.0" fill="rgb(213,185,15)" rx="2" ry="2" />
+<text  x="221.27" y="1055.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="331.6" y="2005" width="0.5" height="15.0" fill="rgb(222,188,16)" rx="2" ry="2" />
+<text  x="334.59" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1157" width="0.6" height="15.0" fill="rgb(232,212,18)" rx="2" ry="2" />
+<text  x="221.27" y="1167.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::SimState::InitializeInstanceFields (2 samples, 0.01%)</title><rect x="573.4" y="2005" width="0.2" height="15.0" fill="rgb(217,157,50)" rx="2" ry="2" />
+<text  x="576.43" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::match (15 samples, 0.11%)</title><rect x="992.8" y="2005" width="1.2" height="15.0" fill="rgb(248,147,20)" rx="2" ry="2" />
+<text  x="995.75" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (91 samples, 0.65%)</title><rect x="613.4" y="2005" width="7.7" height="15.0" fill="rgb(240,109,30)" rx="2" ry="2" />
+<text  x="616.44" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::TableSourceBaseContext::~TableSourceBaseContext (3 samples, 0.02%)</title><rect x="959.5" y="2037" width="0.3" height="15.0" fill="rgb(215,149,23)" rx="2" ry="2" />
+<text  x="962.53" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1221" width="0.6" height="15.0" fill="rgb(251,148,33)" rx="2" ry="2" />
+<text  x="221.27" y="1231.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="951.1" y="1989" width="0.3" height="15.0" fill="rgb(241,133,38)" rx="2" ry="2" />
+<text  x="954.13" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="950.9" y="2021" width="0.2" height="15.0" fill="rgb(250,172,0)" rx="2" ry="2" />
+<text  x="953.88" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="597" width="0.6" height="15.0" fill="rgb(229,84,52)" rx="2" ry="2" />
+<text  x="221.27" y="607.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (9 samples, 0.06%)</title><rect x="215.5" y="2021" width="0.7" height="15.0" fill="rgb(211,124,28)" rx="2" ry="2" />
+<text  x="218.47" y="2031.5" ></text>
+</g>
+<g >
+<title>all (13,921 samples, 100%)</title><rect x="10.0" y="2085" width="1180.0" height="15.0" fill="rgb(241,216,27)" rx="2" ry="2" />
+<text  x="13.00" y="2095.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getType (3 samples, 0.02%)</title><rect x="644.5" y="1989" width="0.3" height="15.0" fill="rgb(245,182,20)" rx="2" ry="2" />
+<text  x="647.54" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::execATN (21 samples, 0.15%)</title><rect x="574.3" y="2005" width="1.8" height="15.0" fill="rgb(222,202,21)" rx="2" ry="2" />
+<text  x="577.27" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="1055.7" y="2005" width="0.9" height="15.0" fill="rgb(205,136,26)" rx="2" ry="2" />
+<text  x="1058.73" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__codecvt_utf8_base&lt;char32_t&gt;::~__codecvt_utf8_base (2 samples, 0.01%)</title><rect x="1057.1" y="2005" width="0.2" height="15.0" fill="rgb(225,12,34)" rx="2" ry="2" />
+<text  x="1060.09" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (2 samples, 0.01%)</title><rect x="217.8" y="1989" width="0.1" height="15.0" fill="rgb(207,225,29)" rx="2" ry="2" />
+<text  x="220.76" y="1999.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (255 samples, 1.83%)</title><rect x="186.1" y="2037" width="21.6" height="15.0" fill="rgb(218,15,46)" rx="2" ry="2" />
+<text  x="189.05" y="2047.5" >[..</text>
+</g>
+<g >
+<title>search_binary_handler (4 samples, 0.03%)</title><rect x="1189.7" y="1973" width="0.3" height="15.0" fill="rgb(217,208,9)" rx="2" ry="2" />
+<text  x="1192.66" y="1983.5" ></text>
+</g>
+<g >
+<title>non-virtual thunk to antlr4::Lexer::getCharPositionInLine (24 samples, 0.17%)</title><rect x="502.1" y="2005" width="2.0" height="15.0" fill="rgb(231,29,1)" rx="2" ry="2" />
+<text  x="505.06" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (2 samples, 0.01%)</title><rect x="455.3" y="1989" width="0.1" height="15.0" fill="rgb(248,0,41)" rx="2" ry="2" />
+<text  x="458.27" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1093" width="0.6" height="15.0" fill="rgb(214,152,4)" rx="2" ry="2" />
+<text  x="221.27" y="1103.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::~CommonToken (407 samples, 2.92%)</title><rect x="472.9" y="2037" width="34.5" height="15.0" fill="rgb(206,159,1)" rx="2" ry="2" />
+<text  x="475.90" y="2047.5" >an..</text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="606.7" y="1941" width="0.3" height="15.0" fill="rgb(226,112,44)" rx="2" ry="2" />
+<text  x="609.65" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1749" width="0.8" height="15.0" fill="rgb(234,127,36)" rx="2" ry="2" />
+<text  x="221.18" y="1759.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="219.8" y="1941" width="0.2" height="15.0" fill="rgb(249,14,35)" rx="2" ry="2" />
+<text  x="222.79" y="1951.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::symbolToNumeric (6 samples, 0.04%)</title><rect x="292.2" y="2021" width="0.5" height="15.0" fill="rgb(245,192,34)" rx="2" ry="2" />
+<text  x="295.18" y="2031.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="769.7" y="1861" width="0.3" height="15.0" fill="rgb(209,23,30)" rx="2" ry="2" />
+<text  x="772.66" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="952.1" y="2005" width="0.2" height="15.0" fill="rgb(229,92,10)" rx="2" ry="2" />
+<text  x="955.07" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::~CommonToken (9 samples, 0.06%)</title><rect x="468.5" y="2005" width="0.8" height="15.0" fill="rgb(234,207,41)" rx="2" ry="2" />
+<text  x="471.49" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ATNConfigSet::ATNConfigSet (2 samples, 0.01%)</title><rect x="565.6" y="2037" width="0.2" height="15.0" fill="rgb(245,170,12)" rx="2" ry="2" />
+<text  x="568.63" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::consume (11 samples, 0.08%)</title><rect x="987.2" y="2005" width="0.9" height="15.0" fill="rgb(227,62,17)" rx="2" ry="2" />
+<text  x="990.16" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::DmlStatementContext::~DmlStatementContext (3 samples, 0.02%)</title><rect x="323.1" y="2021" width="0.3" height="15.0" fill="rgb(248,43,12)" rx="2" ry="2" />
+<text  x="326.12" y="2031.5" ></text>
+</g>
+<g >
+<title>tick_sched_handle (2 samples, 0.01%)</title><rect x="454.7" y="1941" width="0.1" height="15.0" fill="rgb(242,66,48)" rx="2" ry="2" />
+<text  x="457.67" y="1951.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::failOrAccept (146 samples, 1.05%)</title><rect x="585.7" y="1989" width="12.4" height="15.0" fill="rgb(219,1,47)" rx="2" ry="2" />
+<text  x="588.72" y="1999.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt;, std::allocator&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt; &gt; &gt;::_M_realloc_insert&lt;std::unique_ptr&lt;antlr4::Token, std::default_delete&lt;antlr4::Token&gt; &gt; &gt; (7 samples, 0.05%)</title><rect x="1189.1" y="2053" width="0.6" height="15.0" fill="rgb(233,148,42)" rx="2" ry="2" />
+<text  x="1192.07" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.2" y="1989" width="0.2" height="15.0" fill="rgb(209,171,2)" rx="2" ry="2" />
+<text  x="962.19" y="1999.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (61 samples, 0.44%)</title><rect x="180.9" y="2037" width="5.2" height="15.0" fill="rgb(226,78,7)" rx="2" ry="2" />
+<text  x="183.88" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (3 samples, 0.02%)</title><rect x="285.0" y="2021" width="0.2" height="15.0" fill="rgb(229,63,15)" rx="2" ry="2" />
+<text  x="287.97" y="2031.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerATNSimulator::match (4 samples, 0.03%)</title><rect x="1037.9" y="2037" width="0.4" height="15.0" fill="rgb(245,125,1)" rx="2" ry="2" />
+<text  x="1040.93" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="952.7" y="2021" width="0.1" height="15.0" fill="rgb(236,218,30)" rx="2" ry="2" />
+<text  x="955.66" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="952.8" y="1989" width="0.3" height="15.0" fill="rgb(240,207,2)" rx="2" ry="2" />
+<text  x="955.83" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="933" width="0.6" height="15.0" fill="rgb(247,105,52)" rx="2" ry="2" />
+<text  x="221.27" y="943.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (8 samples, 0.06%)</title><rect x="1035.1" y="2005" width="0.6" height="15.0" fill="rgb(220,1,53)" rx="2" ry="2" />
+<text  x="1038.05" y="2015.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__class_type_info::__do_dyncast (7 samples, 0.05%)</title><rect x="331.0" y="2037" width="0.6" height="15.0" fill="rgb(212,1,22)" rx="2" ry="2" />
+<text  x="334.00" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="789" width="0.6" height="15.0" fill="rgb(207,124,54)" rx="2" ry="2" />
+<text  x="221.27" y="799.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 0.03%)</title><rect x="1189.7" y="2037" width="0.3" height="15.0" fill="rgb(207,4,34)" rx="2" ry="2" />
+<text  x="1192.66" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="53" width="0.6" height="15.0" fill="rgb(222,80,33)" rx="2" ry="2" />
+<text  x="221.27" y="63.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::setChannel (4 samples, 0.03%)</title><rect x="1043.4" y="2005" width="0.4" height="15.0" fill="rgb(229,101,33)" rx="2" ry="2" />
+<text  x="1046.44" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1173" width="0.6" height="15.0" fill="rgb(243,212,11)" rx="2" ry="2" />
+<text  x="221.27" y="1183.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::seek (8 samples, 0.06%)</title><rect x="622.1" y="2005" width="0.7" height="15.0" fill="rgb(234,142,17)" rx="2" ry="2" />
+<text  x="625.08" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="1144.4" y="2021" width="0.8" height="15.0" fill="rgb(233,58,38)" rx="2" ry="2" />
+<text  x="1147.40" y="2031.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (3 samples, 0.02%)</title><rect x="454.6" y="1989" width="0.2" height="15.0" fill="rgb(226,45,0)" rx="2" ry="2" />
+<text  x="457.59" y="1999.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__si_class_type_info::__do_dyncast (516 samples, 3.71%)</title><rect x="1061.1" y="2053" width="43.7" height="15.0" fill="rgb(254,156,42)" rx="2" ry="2" />
+<text  x="1064.07" y="2063.5" >__cx..</text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readLock (247 samples, 1.77%)</title><rect x="292.9" y="2021" width="20.9" height="15.0" fill="rgb(254,221,24)" rx="2" ry="2" />
+<text  x="295.86" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="245" width="0.6" height="15.0" fill="rgb(249,224,49)" rx="2" ry="2" />
+<text  x="221.27" y="255.5" ></text>
+</g>
+<g >
+<title>load_elf_binary (4 samples, 0.03%)</title><rect x="1189.7" y="1957" width="0.3" height="15.0" fill="rgb(252,92,39)" rx="2" ry="2" />
+<text  x="1192.66" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1797" width="0.9" height="15.0" fill="rgb(222,71,41)" rx="2" ry="2" />
+<text  x="221.18" y="1807.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getType (8 samples, 0.06%)</title><rect x="527.8" y="2005" width="0.7" height="15.0" fill="rgb(205,165,38)" rx="2" ry="2" />
+<text  x="530.82" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::CaseFunctionCallContext::CaseFunctionCallContext (2 samples, 0.01%)</title><rect x="1020.0" y="2005" width="0.2" height="15.0" fill="rgb(221,23,7)" rx="2" ry="2" />
+<text  x="1023.05" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (13 samples, 0.09%)</title><rect x="329.1" y="2021" width="1.1" height="15.0" fill="rgb(218,80,24)" rx="2" ry="2" />
+<text  x="332.05" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::index (4 samples, 0.03%)</title><rect x="571.6" y="2005" width="0.3" height="15.0" fill="rgb(213,176,53)" rx="2" ry="2" />
+<text  x="574.56" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerATNSimulator::match (15 samples, 0.11%)</title><rect x="602.2" y="2005" width="1.3" height="15.0" fill="rgb(247,91,33)" rx="2" ry="2" />
+<text  x="605.25" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ConstantExpressionAtomContext::~ConstantExpressionAtomContext (4 samples, 0.03%)</title><rect x="951.1" y="2037" width="0.4" height="15.0" fill="rgb(229,182,39)" rx="2" ry="2" />
+<text  x="954.13" y="2047.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="606.7" y="1893" width="0.3" height="15.0" fill="rgb(220,69,18)" rx="2" ry="2" />
+<text  x="609.65" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (18 samples, 0.13%)</title><rect x="922.7" y="2021" width="1.5" height="15.0" fill="rgb(227,30,41)" rx="2" ry="2" />
+<text  x="925.65" y="2031.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (6 samples, 0.04%)</title><rect x="1057.3" y="2037" width="0.6" height="15.0" fill="rgb(239,137,20)" rx="2" ry="2" />
+<text  x="1060.34" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::index (6 samples, 0.04%)</title><rect x="621.1" y="2005" width="0.6" height="15.0" fill="rgb(216,124,2)" rx="2" ry="2" />
+<text  x="624.15" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::seek (7 samples, 0.05%)</title><rect x="1138.4" y="2053" width="0.6" height="15.0" fill="rgb(222,131,29)" rx="2" ry="2" />
+<text  x="1141.38" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="69" width="0.6" height="15.0" fill="rgb(219,36,38)" rx="2" ry="2" />
+<text  x="221.27" y="79.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="564.4" y="1989" width="0.4" height="15.0" fill="rgb(225,7,32)" rx="2" ry="2" />
+<text  x="567.44" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::getTokenStream (3 samples, 0.02%)</title><rect x="992.5" y="2005" width="0.3" height="15.0" fill="rgb(246,215,37)" rx="2" ry="2" />
+<text  x="995.50" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::DefaultErrorStrategy, std::allocator&lt;antlr4::DefaultErrorStrategy&gt;,  (2 samples, 0.01%)</title><rect x="328.8" y="2021" width="0.2" height="15.0" fill="rgb(242,45,48)" rx="2" ry="2" />
+<text  x="331.80" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (9 samples, 0.06%)</title><rect x="956.6" y="2021" width="0.7" height="15.0" fill="rgb(236,81,0)" rx="2" ry="2" />
+<text  x="959.56" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ATNSimulator::~ATNSimulator (2 samples, 0.01%)</title><rect x="623.0" y="2005" width="0.2" height="15.0" fill="rgb(214,223,30)" rx="2" ry="2" />
+<text  x="626.01" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="421" width="0.6" height="15.0" fill="rgb(207,194,23)" rx="2" ry="2" />
+<text  x="221.27" y="431.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::BinaryComparasionPredicateContext::~BinaryComparasionPredicateContext (2 samples, 0.01%)</title><rect x="950.2" y="2037" width="0.2" height="15.0" fill="rgb(251,161,25)" rx="2" ry="2" />
+<text  x="953.20" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getType (4 samples, 0.03%)</title><rect x="975.6" y="2005" width="0.4" height="15.0" fill="rgb(220,119,33)" rx="2" ry="2" />
+<text  x="978.63" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1301" width="0.6" height="15.0" fill="rgb(254,146,28)" rx="2" ry="2" />
+<text  x="221.27" y="1311.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="533.8" y="2005" width="0.1" height="15.0" fill="rgb(249,145,51)" rx="2" ry="2" />
+<text  x="536.76" y="2015.5" ></text>
+</g>
+<g >
+<title>handle_irq (2 samples, 0.01%)</title><rect x="1104.6" y="2005" width="0.2" height="15.0" fill="rgb(214,86,53)" rx="2" ry="2" />
+<text  x="1107.64" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1189" width="0.6" height="15.0" fill="rgb(214,76,27)" rx="2" ry="2" />
+<text  x="221.27" y="1199.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="953.8" y="2021" width="0.2" height="15.0" fill="rgb(249,71,29)" rx="2" ry="2" />
+<text  x="956.85" y="2031.5" ></text>
+</g>
+<g >
+<title>malloc (457 samples, 3.28%)</title><rect x="1145.3" y="2053" width="38.8" height="15.0" fill="rgb(234,9,29)" rx="2" ry="2" />
+<text  x="1148.33" y="2063.5" >mal..</text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (2 samples, 0.01%)</title><rect x="957.1" y="1973" width="0.1" height="15.0" fill="rgb(240,37,30)" rx="2" ry="2" />
+<text  x="960.07" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::constant (9 samples, 0.06%)</title><rect x="1023.4" y="2005" width="0.8" height="15.0" fill="rgb(214,17,17)" rx="2" ry="2" />
+<text  x="1026.44" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::~CommonToken (2 samples, 0.01%)</title><rect x="285.2" y="2021" width="0.2" height="15.0" fill="rgb(216,163,32)" rx="2" ry="2" />
+<text  x="288.23" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::computeTargetState (17 samples, 0.12%)</title><rect x="604.9" y="2005" width="1.4" height="15.0" fill="rgb(252,171,43)" rx="2" ry="2" />
+<text  x="607.87" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SimpleIdContext::~SimpleIdContext (17 samples, 0.12%)</title><rect x="957.5" y="2037" width="1.4" height="15.0" fill="rgb(246,60,2)" rx="2" ry="2" />
+<text  x="960.49" y="2047.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (23 samples, 0.17%)</title><rect x="600.3" y="2005" width="1.9" height="15.0" fill="rgb(225,38,36)" rx="2" ry="2" />
+<text  x="603.30" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (9 samples, 0.06%)</title><rect x="472.9" y="2005" width="0.8" height="15.0" fill="rgb(230,69,11)" rx="2" ry="2" />
+<text  x="475.90" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::PredicateExpressionContext::~PredicateExpressionContext (4 samples, 0.03%)</title><rect x="326.7" y="2021" width="0.3" height="15.0" fill="rgb(253,130,3)" rx="2" ry="2" />
+<text  x="329.68" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="950.5" y="2021" width="0.4" height="15.0" fill="rgb(241,217,1)" rx="2" ry="2" />
+<text  x="953.54" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="949.7" y="2021" width="0.4" height="15.0" fill="rgb(210,58,32)" rx="2" ry="2" />
+<text  x="952.69" y="2031.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="284.1" y="1909" width="0.4" height="15.0" fill="rgb(224,181,39)" rx="2" ry="2" />
+<text  x="287.13" y="1919.5" ></text>
+</g>
+<g >
+<title>benchmark::internal::Increment (10 samples, 0.07%)</title><rect x="1144.4" y="2053" width="0.8" height="15.0" fill="rgb(213,57,0)" rx="2" ry="2" />
+<text  x="1147.40" y="2063.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (32 samples, 0.23%)</title><rect x="464.9" y="2005" width="2.7" height="15.0" fill="rgb(229,208,3)" rx="2" ry="2" />
+<text  x="467.93" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::~CommonTokenStream (293 samples, 2.10%)</title><rect x="508.9" y="2037" width="24.9" height="15.0" fill="rgb(232,221,46)" rx="2" ry="2" />
+<text  x="511.92" y="2047.5" >a..</text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::consume (10 samples, 0.07%)</title><rect x="974.5" y="2005" width="0.9" height="15.0" fill="rgb(250,212,28)" rx="2" ry="2" />
+<text  x="977.53" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readLock (109 samples, 0.78%)</title><rect x="892.6" y="2005" width="9.3" height="15.0" fill="rgb(210,38,6)" rx="2" ry="2" />
+<text  x="895.65" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (2 samples, 0.01%)</title><rect x="313.8" y="2021" width="0.2" height="15.0" fill="rgb(254,215,29)" rx="2" ry="2" />
+<text  x="316.79" y="2031.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (6 samples, 0.04%)</title><rect x="474.8" y="1989" width="0.5" height="15.0" fill="rgb(214,166,34)" rx="2" ry="2" />
+<text  x="477.76" y="1999.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="958.9" y="2005" width="0.2" height="15.0" fill="rgb(242,211,47)" rx="2" ry="2" />
+<text  x="961.93" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::setLine (4 samples, 0.03%)</title><rect x="549.3" y="2021" width="0.3" height="15.0" fill="rgb(216,166,13)" rx="2" ry="2" />
+<text  x="552.27" y="2031.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.01%)</title><rect x="1183.9" y="2037" width="0.2" height="15.0" fill="rgb(211,146,12)" rx="2" ry="2" />
+<text  x="1186.90" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::consume (94 samples, 0.68%)</title><rect x="780.8" y="2005" width="8.0" height="15.0" fill="rgb(232,33,10)" rx="2" ry="2" />
+<text  x="783.84" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="221.7" y="1989" width="0.2" height="15.0" fill="rgb(238,227,16)" rx="2" ry="2" />
+<text  x="224.74" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="955.8" y="1989" width="0.2" height="15.0" fill="rgb(236,117,24)" rx="2" ry="2" />
+<text  x="958.80" y="1999.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::atn::SingletonPredictionContext, std::allocator&lt;antlr4::atn::SingletonPredictionContext&gt;,  (10 samples, 0.07%)</title><rect x="1055.7" y="2037" width="0.9" height="15.0" fill="rgb(207,159,19)" rx="2" ry="2" />
+<text  x="1058.73" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (170 samples, 1.22%)</title><rect x="1041.2" y="2021" width="14.4" height="15.0" fill="rgb(217,93,18)" rx="2" ry="2" />
+<text  x="1044.24" y="2031.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (14 samples, 0.10%)</title><rect x="607.0" y="2005" width="1.2" height="15.0" fill="rgb(234,20,45)" rx="2" ry="2" />
+<text  x="609.99" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readUnlock (25 samples, 0.18%)</title><rect x="901.9" y="2005" width="2.1" height="15.0" fill="rgb(221,175,22)" rx="2" ry="2" />
+<text  x="904.89" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1621" width="0.8" height="15.0" fill="rgb(251,190,24)" rx="2" ry="2" />
+<text  x="221.18" y="1631.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.01%)</title><rect x="1104.5" y="2037" width="0.1" height="15.0" fill="rgb(208,18,35)" rx="2" ry="2" />
+<text  x="1107.47" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::LogicalOperatorContext::~LogicalOperatorContext (2 samples, 0.01%)</title><rect x="954.7" y="2037" width="0.2" height="15.0" fill="rgb(241,219,9)" rx="2" ry="2" />
+<text  x="957.70" y="2047.5" ></text>
+</g>
+<g >
+<title>operator new (2 samples, 0.01%)</title><rect x="1040.9" y="1973" width="0.2" height="15.0" fill="rgb(254,197,22)" rx="2" ry="2" />
+<text  x="1043.90" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="955.8" y="2005" width="0.3" height="15.0" fill="rgb(223,96,37)" rx="2" ry="2" />
+<text  x="958.80" y="2015.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (14 samples, 0.10%)</title><rect x="612.2" y="2005" width="1.2" height="15.0" fill="rgb(216,1,24)" rx="2" ry="2" />
+<text  x="615.25" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="956.4" y="2021" width="0.2" height="15.0" fill="rgb(246,16,19)" rx="2" ry="2" />
+<text  x="959.39" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.5" y="1989" width="0.2" height="15.0" fill="rgb(218,123,29)" rx="2" ry="2" />
+<text  x="962.53" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1861" width="0.9" height="15.0" fill="rgb(244,102,35)" rx="2" ry="2" />
+<text  x="221.18" y="1871.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__class_type_info::~__class_type_info (6 samples, 0.04%)</title><rect x="331.6" y="2037" width="0.5" height="15.0" fill="rgb(223,147,33)" rx="2" ry="2" />
+<text  x="334.59" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::TableSourceBaseContext::TableSourceBaseContext (2 samples, 0.01%)</title><rect x="562.9" y="2005" width="0.2" height="15.0" fill="rgb(207,122,36)" rx="2" ry="2" />
+<text  x="565.92" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::copyFrom (2 samples, 0.01%)</title><rect x="956.2" y="2005" width="0.2" height="15.0" fill="rgb(251,62,33)" rx="2" ry="2" />
+<text  x="959.22" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::SingleWriteMultipleReadLock::readLock (18 samples, 0.13%)</title><rect x="692.9" y="1989" width="1.5" height="15.0" fill="rgb(250,61,39)" rx="2" ry="2" />
+<text  x="695.86" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::fullId (4 samples, 0.03%)</title><rect x="1027.7" y="2005" width="0.3" height="15.0" fill="rgb(231,92,51)" rx="2" ry="2" />
+<text  x="1030.68" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="1060.1" y="2005" width="0.6" height="15.0" fill="rgb(249,94,10)" rx="2" ry="2" />
+<text  x="1063.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="1189.7" y="2053" width="0.3" height="15.0" fill="rgb(215,184,46)" rx="2" ry="2" />
+<text  x="1192.66" y="2063.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="769.7" y="1845" width="0.3" height="15.0" fill="rgb(235,159,2)" rx="2" ry="2" />
+<text  x="772.66" y="1855.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (3 samples, 0.02%)</title><rect x="454.6" y="2005" width="0.2" height="15.0" fill="rgb(225,129,37)" rx="2" ry="2" />
+<text  x="457.59" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (7 samples, 0.05%)</title><rect x="566.5" y="2005" width="0.6" height="15.0" fill="rgb(215,136,25)" rx="2" ry="2" />
+<text  x="569.48" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::logicalOperator (5 samples, 0.04%)</title><rect x="1029.3" y="2005" width="0.4" height="15.0" fill="rgb(227,108,5)" rx="2" ry="2" />
+<text  x="1032.29" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="1040.6" y="1989" width="0.6" height="15.0" fill="rgb(227,44,47)" rx="2" ry="2" />
+<text  x="1043.56" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.09%)</title><rect x="715.4" y="2021" width="1.0" height="15.0" fill="rgb(218,90,32)" rx="2" ry="2" />
+<text  x="718.41" y="2031.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="284.1" y="1941" width="0.4" height="15.0" fill="rgb(234,198,8)" rx="2" ry="2" />
+<text  x="287.13" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="453" width="0.6" height="15.0" fill="rgb(253,1,43)" rx="2" ry="2" />
+<text  x="221.27" y="463.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="309" width="0.6" height="15.0" fill="rgb(237,110,17)" rx="2" ry="2" />
+<text  x="221.27" y="319.5" ></text>
+</g>
+<g >
+<title>std::__codecvt_utf8_base&lt;char32_t&gt;::do_max_length (7 samples, 0.05%)</title><rect x="283.9" y="2005" width="0.6" height="15.0" fill="rgb(215,225,3)" rx="2" ry="2" />
+<text  x="286.87" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="117" width="0.6" height="15.0" fill="rgb(234,106,37)" rx="2" ry="2" />
+<text  x="221.27" y="127.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::notify_one (4 samples, 0.03%)</title><rect x="696.2" y="1989" width="0.3" height="15.0" fill="rgb(221,54,51)" rx="2" ry="2" />
+<text  x="699.16" y="1999.5" ></text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::setParent (2 samples, 0.01%)</title><rect x="956.4" y="2005" width="0.2" height="15.0" fill="rgb(211,79,2)" rx="2" ry="2" />
+<text  x="959.39" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::addChild (2 samples, 0.01%)</title><rect x="957.9" y="2005" width="0.2" height="15.0" fill="rgb(241,67,49)" rx="2" ry="2" />
+<text  x="960.92" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Recognizer::getState (10 samples, 0.07%)</title><rect x="996.2" y="2005" width="0.9" height="15.0" fill="rgb(249,195,13)" rx="2" ry="2" />
+<text  x="999.23" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="951.5" y="2021" width="0.5" height="15.0" fill="rgb(208,200,17)" rx="2" ry="2" />
+<text  x="954.47" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="952.1" y="1989" width="0.1" height="15.0" fill="rgb(223,59,9)" rx="2" ry="2" />
+<text  x="955.07" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.5" y="2005" width="0.2" height="15.0" fill="rgb(206,7,33)" rx="2" ry="2" />
+<text  x="962.53" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1717" width="0.8" height="15.0" fill="rgb(249,142,19)" rx="2" ry="2" />
+<text  x="221.18" y="1727.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::emptyStatement (2 samples, 0.01%)</title><rect x="1024.6" y="2005" width="0.2" height="15.0" fill="rgb(234,114,12)" rx="2" ry="2" />
+<text  x="1027.63" y="2015.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_lock (752 samples, 5.40%)</title><rect x="332.1" y="2037" width="63.7" height="15.0" fill="rgb(247,123,48)" rx="2" ry="2" />
+<text  x="335.10" y="2047.5" >__pthre..</text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="284.1" y="1893" width="0.4" height="15.0" fill="rgb(219,54,51)" rx="2" ry="2" />
+<text  x="287.13" y="1903.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (9 samples, 0.06%)</title><rect x="467.6" y="2005" width="0.8" height="15.0" fill="rgb(215,2,39)" rx="2" ry="2" />
+<text  x="470.64" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (5 samples, 0.04%)</title><rect x="329.5" y="2005" width="0.4" height="15.0" fill="rgb(213,140,54)" rx="2" ry="2" />
+<text  x="332.48" y="2015.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="769.7" y="1877" width="0.3" height="15.0" fill="rgb(252,182,35)" rx="2" ry="2" />
+<text  x="772.66" y="1887.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::LexerATNSimulator (3 samples, 0.02%)</title><rect x="949.1" y="2005" width="0.3" height="15.0" fill="rgb(227,15,43)" rx="2" ry="2" />
+<text  x="952.10" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::OrderedATNConfigSet::~OrderedATNConfigSet (17 samples, 0.12%)</title><rect x="604.9" y="2037" width="1.4" height="15.0" fill="rgb(244,83,39)" rx="2" ry="2" />
+<text  x="607.87" y="2047.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (2 samples, 0.01%)</title><rect x="1183.9" y="2021" width="0.2" height="15.0" fill="rgb(248,200,35)" rx="2" ry="2" />
+<text  x="1186.90" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="952.1" y="2021" width="0.6" height="15.0" fill="rgb(209,125,12)" rx="2" ry="2" />
+<text  x="955.07" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="1040.6" y="2005" width="0.6" height="15.0" fill="rgb(253,33,50)" rx="2" ry="2" />
+<text  x="1043.56" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.10%)</title><rect x="564.4" y="2005" width="1.2" height="15.0" fill="rgb(226,3,29)" rx="2" ry="2" />
+<text  x="567.44" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::mark (12 samples, 0.09%)</title><rect x="571.9" y="2005" width="1.0" height="15.0" fill="rgb(205,155,25)" rx="2" ry="2" />
+<text  x="574.90" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::addChild (11 samples, 0.08%)</title><rect x="995.1" y="2005" width="1.0" height="15.0" fill="rgb(215,162,18)" rx="2" ry="2" />
+<text  x="998.13" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::AggregateFunctionCallContext::~AggregateFunctionCallContext (2 samples, 0.01%)</title><rect x="949.5" y="2037" width="0.2" height="15.0" fill="rgb(229,164,9)" rx="2" ry="2" />
+<text  x="952.52" y="2047.5" ></text>
+</g>
+<g >
+<title>cfree (6 samples, 0.04%)</title><rect x="947.0" y="2037" width="0.5" height="15.0" fill="rgb(254,203,4)" rx="2" ry="2" />
+<text  x="949.98" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="952.8" y="2005" width="0.4" height="15.0" fill="rgb(240,39,11)" rx="2" ry="2" />
+<text  x="955.83" y="2015.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.01%)</title><rect x="956.9" y="1973" width="0.2" height="15.0" fill="rgb(212,5,20)" rx="2" ry="2" />
+<text  x="959.90" y="1983.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::InitializeInstanceFields (3 samples, 0.02%)</title><rect x="1140.4" y="2053" width="0.3" height="15.0" fill="rgb(227,213,51)" rx="2" ry="2" />
+<text  x="1143.41" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1445" width="0.6" height="15.0" fill="rgb(247,91,33)" rx="2" ry="2" />
+<text  x="221.27" y="1455.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (2 samples, 0.01%)</title><rect x="1039.8" y="1989" width="0.2" height="15.0" fill="rgb(224,55,51)" rx="2" ry="2" />
+<text  x="1042.80" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::aggregateWindowedFunction (5 samples, 0.04%)</title><rect x="1022.8" y="2005" width="0.4" height="15.0" fill="rgb(237,202,38)" rx="2" ry="2" />
+<text  x="1025.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (43 samples, 0.31%)</title><rect x="455.3" y="2005" width="3.6" height="15.0" fill="rgb(251,209,36)" rx="2" ry="2" />
+<text  x="458.27" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="1060.1" y="1989" width="0.6" height="15.0" fill="rgb(220,149,23)" rx="2" ry="2" />
+<text  x="1063.14" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="1144.4" y="2037" width="0.8" height="15.0" fill="rgb(227,208,16)" rx="2" ry="2" />
+<text  x="1147.40" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1461" width="0.6" height="15.0" fill="rgb(244,76,46)" rx="2" ry="2" />
+<text  x="221.27" y="1471.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1893" width="0.9" height="15.0" fill="rgb(241,183,46)" rx="2" ry="2" />
+<text  x="221.18" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (117 samples, 0.84%)</title><rect x="463.0" y="2021" width="9.9" height="15.0" fill="rgb(217,30,44)" rx="2" ry="2" />
+<text  x="465.98" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::ProxyErrorListener::~ProxyErrorListener (4 samples, 0.03%)</title><rect x="563.7" y="2037" width="0.3" height="15.0" fill="rgb(248,0,49)" rx="2" ry="2" />
+<text  x="566.68" y="2047.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerATNSimulator::match (46 samples, 0.33%)</title><rect x="567.7" y="1989" width="3.9" height="15.0" fill="rgb(233,182,49)" rx="2" ry="2" />
+<text  x="570.66" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="629" width="0.6" height="15.0" fill="rgb(218,191,52)" rx="2" ry="2" />
+<text  x="221.27" y="639.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (3 samples, 0.02%)</title><rect x="1055.1" y="2005" width="0.3" height="15.0" fill="rgb(244,160,42)" rx="2" ry="2" />
+<text  x="1058.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.9" y="2021" width="0.1" height="15.0" fill="rgb(224,16,52)" rx="2" ry="2" />
+<text  x="962.87" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::exitRule (7 samples, 0.05%)</title><rect x="1141.9" y="2053" width="0.6" height="15.0" fill="rgb(242,43,35)" rx="2" ry="2" />
+<text  x="1144.94" y="2063.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::simpleId (8 samples, 0.06%)</title><rect x="1031.8" y="2005" width="0.7" height="15.0" fill="rgb(236,83,30)" rx="2" ry="2" />
+<text  x="1034.83" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (14 samples, 0.10%)</title><rect x="964.4" y="1989" width="1.2" height="15.0" fill="rgb(220,38,8)" rx="2" ry="2" />
+<text  x="967.44" y="1999.5" ></text>
+</g>
+<g >
+<title>[benchmark] (2 samples, 0.01%)</title><rect x="208.2" y="2021" width="0.1" height="15.0" fill="rgb(220,226,0)" rx="2" ry="2" />
+<text  x="211.18" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::root (2 samples, 0.01%)</title><rect x="1031.0" y="2005" width="0.2" height="15.0" fill="rgb(233,84,0)" rx="2" ry="2" />
+<text  x="1033.98" y="2015.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (17 samples, 0.12%)</title><rect x="722.5" y="2005" width="1.5" height="15.0" fill="rgb(208,188,21)" rx="2" ry="2" />
+<text  x="725.53" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::PredicateExpressionContext::~PredicateExpressionContext (8 samples, 0.06%)</title><rect x="955.7" y="2037" width="0.7" height="15.0" fill="rgb(245,34,36)" rx="2" ry="2" />
+<text  x="958.71" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (2 samples, 0.01%)</title><rect x="219.3" y="1957" width="0.2" height="15.0" fill="rgb(239,174,32)" rx="2" ry="2" />
+<text  x="222.28" y="1967.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="613.7" y="1989" width="0.3" height="15.0" fill="rgb(246,221,34)" rx="2" ry="2" />
+<text  x="616.69" y="1999.5" ></text>
+</g>
+<g >
+<title>operator delete (4 samples, 0.03%)</title><rect x="616.8" y="1973" width="0.4" height="15.0" fill="rgb(216,131,40)" rx="2" ry="2" />
+<text  x="619.83" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FunctionArgContext::FunctionArgContext (2 samples, 0.01%)</title><rect x="1020.6" y="2005" width="0.2" height="15.0" fill="rgb(206,20,13)" rx="2" ry="2" />
+<text  x="1023.64" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (2 samples, 0.01%)</title><rect x="1041.1" y="1957" width="0.1" height="15.0" fill="rgb(248,22,54)" rx="2" ry="2" />
+<text  x="1044.07" y="1967.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (5 samples, 0.04%)</title><rect x="964.0" y="2005" width="0.4" height="15.0" fill="rgb(220,81,6)" rx="2" ry="2" />
+<text  x="967.02" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::removeLastChild (2 samples, 0.01%)</title><rect x="996.1" y="2005" width="0.1" height="15.0" fill="rgb(213,67,48)" rx="2" ry="2" />
+<text  x="999.06" y="2015.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (3 samples, 0.02%)</title><rect x="454.6" y="1973" width="0.2" height="15.0" fill="rgb(224,129,8)" rx="2" ry="2" />
+<text  x="457.59" y="1983.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="769.7" y="1925" width="0.3" height="15.0" fill="rgb(220,53,11)" rx="2" ry="2" />
+<text  x="772.66" y="1935.5" ></text>
+</g>
+<g >
+<title>cfree (12 samples, 0.09%)</title><rect x="615.8" y="1973" width="1.0" height="15.0" fill="rgb(225,106,5)" rx="2" ry="2" />
+<text  x="618.81" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="869" width="0.6" height="15.0" fill="rgb(227,157,1)" rx="2" ry="2" />
+<text  x="221.27" y="879.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1765" width="0.8" height="15.0" fill="rgb(247,128,22)" rx="2" ry="2" />
+<text  x="221.18" y="1775.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="716.4" y="2021" width="0.4" height="15.0" fill="rgb(223,200,6)" rx="2" ry="2" />
+<text  x="719.42" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FullIdContext::~FullIdContext (2 samples, 0.01%)</title><rect x="953.8" y="2037" width="0.2" height="15.0" fill="rgb(220,70,13)" rx="2" ry="2" />
+<text  x="956.85" y="2047.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (10 samples, 0.07%)</title><rect x="617.2" y="1973" width="0.8" height="15.0" fill="rgb(206,22,17)" rx="2" ry="2" />
+<text  x="620.16" y="1983.5" ></text>
+</g>
+<g >
+<title>std::codecvt_utf8&lt;char32_t, 1114111ul,  (3 samples, 0.02%)</title><rect x="1057.1" y="2037" width="0.2" height="15.0" fill="rgb(209,119,10)" rx="2" ry="2" />
+<text  x="1060.09" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::enterRule (18 samples, 0.13%)</title><rect x="990.5" y="2005" width="1.5" height="15.0" fill="rgb(227,169,6)" rx="2" ry="2" />
+<text  x="993.47" y="2015.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="606.7" y="1877" width="0.3" height="15.0" fill="rgb(225,85,16)" rx="2" ry="2" />
+<text  x="609.65" y="1887.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ATN::nextTokens (62 samples, 0.45%)</title><rect x="999.8" y="2005" width="5.2" height="15.0" fill="rgb(215,1,33)" rx="2" ry="2" />
+<text  x="1002.79" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SelectElementsContext::SelectElementsContext (2 samples, 0.01%)</title><rect x="1021.7" y="2005" width="0.2" height="15.0" fill="rgb(233,203,1)" rx="2" ry="2" />
+<text  x="1024.74" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1397" width="0.6" height="15.0" fill="rgb(219,150,9)" rx="2" ry="2" />
+<text  x="221.27" y="1407.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="954.9" y="2021" width="0.2" height="15.0" fill="rgb(221,220,31)" rx="2" ry="2" />
+<text  x="957.86" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="225.1" y="1989" width="0.2" height="15.0" fill="rgb(213,165,34)" rx="2" ry="2" />
+<text  x="228.13" y="1999.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="217.3" y="2005" width="0.4" height="15.0" fill="rgb(209,35,32)" rx="2" ry="2" />
+<text  x="220.33" y="2015.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (89 samples, 0.64%)</title><rect x="480.0" y="2005" width="7.6" height="15.0" fill="rgb(230,97,18)" rx="2" ry="2" />
+<text  x="483.02" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (35 samples, 0.25%)</title><rect x="212.5" y="2021" width="3.0" height="15.0" fill="rgb(206,15,12)" rx="2" ry="2" />
+<text  x="215.50" y="2031.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace (14 samples, 0.10%)</title><rect x="1186.3" y="2053" width="1.2" height="15.0" fill="rgb(236,74,41)" rx="2" ry="2" />
+<text  x="1189.27" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="949.0" y="2021" width="0.5" height="15.0" fill="rgb(224,159,24)" rx="2" ry="2" />
+<text  x="952.02" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (10,379 samples, 74.56%)</title><rect x="180.9" y="2053" width="879.8" height="15.0" fill="rgb(254,212,53)" rx="2" ry="2" />
+<text  x="183.88" y="2063.5" >[unknown]</text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (4 samples, 0.03%)</title><rect x="284.1" y="1989" width="0.4" height="15.0" fill="rgb(250,96,2)" rx="2" ry="2" />
+<text  x="287.13" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="220.4" y="1957" width="0.2" height="15.0" fill="rgb(216,112,54)" rx="2" ry="2" />
+<text  x="223.38" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1029" width="0.6" height="15.0" fill="rgb(243,219,24)" rx="2" ry="2" />
+<text  x="221.27" y="1039.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (3 samples, 0.02%)</title><rect x="222.1" y="1973" width="0.2" height="15.0" fill="rgb(240,203,37)" rx="2" ry="2" />
+<text  x="225.08" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1013" width="0.6" height="15.0" fill="rgb(234,49,7)" rx="2" ry="2" />
+<text  x="221.27" y="1023.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="959.5" y="2021" width="0.3" height="15.0" fill="rgb(221,194,9)" rx="2" ry="2" />
+<text  x="962.53" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="954.0" y="2021" width="0.3" height="15.0" fill="rgb(208,58,25)" rx="2" ry="2" />
+<text  x="957.02" y="2031.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::Lexer::nextToken (7 samples, 0.05%)</title><rect x="1037.3" y="2037" width="0.6" height="15.0" fill="rgb(246,182,40)" rx="2" ry="2" />
+<text  x="1040.34" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::InitializeInstanceFields (2 samples, 0.01%)</title><rect x="564.3" y="2005" width="0.1" height="15.0" fill="rgb(241,156,35)" rx="2" ry="2" />
+<text  x="567.27" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (14 samples, 0.10%)</title><rect x="478.1" y="1989" width="1.2" height="15.0" fill="rgb(215,31,11)" rx="2" ry="2" />
+<text  x="481.07" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SelectStatementContext::SelectStatementContext (2 samples, 0.01%)</title><rect x="1022.1" y="2005" width="0.2" height="15.0" fill="rgb(236,100,16)" rx="2" ry="2" />
+<text  x="1025.08" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::predicate (11 samples, 0.08%)</title><rect x="1029.9" y="2005" width="0.9" height="15.0" fill="rgb(217,136,54)" rx="2" ry="2" />
+<text  x="1032.88" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::getLine (3 samples, 0.02%)</title><rect x="501.0" y="2005" width="0.3" height="15.0" fill="rgb(235,128,5)" rx="2" ry="2" />
+<text  x="504.04" y="2015.5" ></text>
+</g>
+<g >
+<title>perf_event_exec (4 samples, 0.03%)</title><rect x="1189.7" y="1925" width="0.3" height="15.0" fill="rgb(214,179,8)" rx="2" ry="2" />
+<text  x="1192.66" y="1935.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::~CommonToken (4 samples, 0.03%)</title><rect x="475.7" y="1989" width="0.3" height="15.0" fill="rgb(208,114,41)" rx="2" ry="2" />
+<text  x="478.69" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (4 samples, 0.03%)</title><rect x="222.4" y="2005" width="0.4" height="15.0" fill="rgb(251,228,6)" rx="2" ry="2" />
+<text  x="225.42" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::decimalLiteral (4 samples, 0.03%)</title><rect x="1024.2" y="2005" width="0.3" height="15.0" fill="rgb(212,228,52)" rx="2" ry="2" />
+<text  x="1027.20" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (2 samples, 0.01%)</title><rect x="715.9" y="1957" width="0.2" height="15.0" fill="rgb(239,172,22)" rx="2" ry="2" />
+<text  x="718.91" y="1967.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlLexer::~MySqlLexer (6 samples, 0.04%)</title><rect x="949.0" y="2037" width="0.5" height="15.0" fill="rgb(213,194,13)" rx="2" ry="2" />
+<text  x="952.02" y="2047.5" ></text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::~TerminalNodeImpl (6 samples, 0.04%)</title><rect x="1060.1" y="2037" width="0.6" height="15.0" fill="rgb(228,124,41)" rx="2" ry="2" />
+<text  x="1063.14" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::sqlStatements (2 samples, 0.01%)</title><rect x="1032.7" y="2005" width="0.1" height="15.0" fill="rgb(221,107,12)" rx="2" ry="2" />
+<text  x="1035.68" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::contains (4 samples, 0.03%)</title><rect x="291.8" y="2021" width="0.4" height="15.0" fill="rgb(230,166,48)" rx="2" ry="2" />
+<text  x="294.84" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1039.3" y="2021" width="0.2" height="15.0" fill="rgb(252,84,31)" rx="2" ry="2" />
+<text  x="1042.29" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="853" width="0.6" height="15.0" fill="rgb(228,152,38)" rx="2" ry="2" />
+<text  x="221.27" y="863.5" ></text>
+</g>
+<g >
+<title>[unknown] (53 samples, 0.38%)</title><rect x="567.1" y="2005" width="4.5" height="15.0" fill="rgb(242,65,52)" rx="2" ry="2" />
+<text  x="570.07" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1845" width="0.9" height="15.0" fill="rgb(210,195,32)" rx="2" ry="2" />
+<text  x="221.18" y="1855.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::setTokenIndex (5 samples, 0.04%)</title><rect x="1139.8" y="2053" width="0.4" height="15.0" fill="rgb(246,71,46)" rx="2" ry="2" />
+<text  x="1142.82" y="2063.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (3 samples, 0.02%)</title><rect x="951.1" y="1973" width="0.3" height="15.0" fill="rgb(205,136,15)" rx="2" ry="2" />
+<text  x="954.13" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::querySpecification (2 samples, 0.01%)</title><rect x="1030.8" y="2005" width="0.2" height="15.0" fill="rgb(220,37,1)" rx="2" ry="2" />
+<text  x="1033.81" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1253" width="0.6" height="15.0" fill="rgb(252,147,29)" rx="2" ry="2" />
+<text  x="221.27" y="1263.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.09%)</title><rect x="218.2" y="1957" width="1.1" height="15.0" fill="rgb(241,117,15)" rx="2" ry="2" />
+<text  x="221.18" y="1967.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_unlock (697 samples, 5.01%)</title><rect x="395.8" y="2037" width="59.1" height="15.0" fill="rgb(215,26,54)" rx="2" ry="2" />
+<text  x="398.85" y="2047.5" >__pthr..</text>
+</g>
+<g >
+<title>[libc-2.30.so] (3 samples, 0.02%)</title><rect x="956.6" y="1973" width="0.2" height="15.0" fill="rgb(228,41,5)" rx="2" ry="2" />
+<text  x="959.56" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="261" width="0.6" height="15.0" fill="rgb(244,228,20)" rx="2" ry="2" />
+<text  x="221.27" y="271.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (14 samples, 0.10%)</title><rect x="706.6" y="2005" width="1.2" height="15.0" fill="rgb(239,59,38)" rx="2" ry="2" />
+<text  x="709.59" y="2015.5" ></text>
+</g>
+<g >
+<title>operator new (9 samples, 0.06%)</title><rect x="711.2" y="2005" width="0.7" height="15.0" fill="rgb(248,209,44)" rx="2" ry="2" />
+<text  x="714.17" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="715.5" y="1973" width="0.2" height="15.0" fill="rgb(218,66,53)" rx="2" ry="2" />
+<text  x="718.49" y="1983.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (4 samples, 0.03%)</title><rect x="216.4" y="2005" width="0.3" height="15.0" fill="rgb(254,63,48)" rx="2" ry="2" />
+<text  x="219.40" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::InitializeInstanceFields (3 samples, 0.02%)</title><rect x="1142.7" y="2053" width="0.3" height="15.0" fill="rgb(241,206,49)" rx="2" ry="2" />
+<text  x="1145.70" y="2063.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (3 samples, 0.02%)</title><rect x="614.0" y="1973" width="0.3" height="15.0" fill="rgb(251,136,11)" rx="2" ry="2" />
+<text  x="617.03" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="959.2" y="2005" width="0.2" height="15.0" fill="rgb(236,55,41)" rx="2" ry="2" />
+<text  x="962.19" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::DefaultErrorStrategy::reportMatch (3 samples, 0.02%)</title><rect x="977.0" y="2005" width="0.2" height="15.0" fill="rgb(237,58,9)" rx="2" ry="2" />
+<text  x="979.99" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (4 samples, 0.03%)</title><rect x="291.5" y="2021" width="0.3" height="15.0" fill="rgb(247,51,25)" rx="2" ry="2" />
+<text  x="294.50" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="805" width="0.6" height="15.0" fill="rgb(215,168,37)" rx="2" ry="2" />
+<text  x="221.27" y="815.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;parsers::MySqlParser::uid (2 samples, 0.01%)</title><rect x="966.5" y="1989" width="0.1" height="15.0" fill="rgb(227,34,40)" rx="2" ry="2" />
+<text  x="969.48" y="1999.5" ></text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::~TerminalNodeImpl (7 samples, 0.05%)</title><rect x="923.6" y="2005" width="0.6" height="15.0" fill="rgb(213,185,8)" rx="2" ry="2" />
+<text  x="926.59" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="501" width="0.6" height="15.0" fill="rgb(243,64,25)" rx="2" ry="2" />
+<text  x="221.27" y="511.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::atn::EmptyPredictionContext, std::allocator&lt;antlr4::atn::EmptyPredictionContext&gt;,  (8 samples, 0.06%)</title><rect x="1040.6" y="2037" width="0.6" height="15.0" fill="rgb(217,106,53)" rx="2" ry="2" />
+<text  x="1043.56" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ExpressionAtomPredicateContext::ExpressionAtomPredicateContext (2 samples, 0.01%)</title><rect x="1020.3" y="2005" width="0.2" height="15.0" fill="rgb(235,217,2)" rx="2" ry="2" />
+<text  x="1023.30" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="953.2" y="2021" width="0.6" height="15.0" fill="rgb(214,179,15)" rx="2" ry="2" />
+<text  x="956.17" y="2031.5" ></text>
+</g>
+<g >
+<title>malloc (14 samples, 0.10%)</title><rect x="618.0" y="1989" width="1.2" height="15.0" fill="rgb(221,93,11)" rx="2" ry="2" />
+<text  x="621.01" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1061" width="0.6" height="15.0" fill="rgb(236,52,28)" rx="2" ry="2" />
+<text  x="221.27" y="1071.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="951.1" y="2005" width="0.3" height="15.0" fill="rgb(246,23,38)" rx="2" ry="2" />
+<text  x="954.13" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (2 samples, 0.01%)</title><rect x="329.3" y="2005" width="0.2" height="15.0" fill="rgb(212,161,40)" rx="2" ry="2" />
+<text  x="332.31" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::nextToken (24 samples, 0.17%)</title><rect x="476.0" y="1989" width="2.1" height="15.0" fill="rgb(241,188,41)" rx="2" ry="2" />
+<text  x="479.03" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::RuleContext (8 samples, 0.06%)</title><rect x="1143.0" y="2053" width="0.6" height="15.0" fill="rgb(208,202,35)" rx="2" ry="2" />
+<text  x="1145.96" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="405" width="0.6" height="15.0" fill="rgb(222,88,31)" rx="2" ry="2" />
+<text  x="221.27" y="415.5" ></text>
+</g>
+<g >
+<title>cfree (25 samples, 0.18%)</title><rect x="707.8" y="2005" width="2.1" height="15.0" fill="rgb(233,169,25)" rx="2" ry="2" />
+<text  x="710.78" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="901" width="0.6" height="15.0" fill="rgb(236,143,8)" rx="2" ry="2" />
+<text  x="221.27" y="911.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (3 samples, 0.02%)</title><rect x="328.4" y="2021" width="0.2" height="15.0" fill="rgb(236,183,28)" rx="2" ry="2" />
+<text  x="331.37" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="950.2" y="2021" width="0.2" height="15.0" fill="rgb(239,201,7)" rx="2" ry="2" />
+<text  x="953.20" y="2031.5" ></text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (84 samples, 0.60%)</title><rect x="904.0" y="2005" width="7.1" height="15.0" fill="rgb(228,213,51)" rx="2" ry="2" />
+<text  x="907.01" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (5 samples, 0.04%)</title><rect x="1056.7" y="2021" width="0.4" height="15.0" fill="rgb(245,124,9)" rx="2" ry="2" />
+<text  x="1059.67" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FunctionCallExpressionAtomContext::~FunctionCallExpressionAtomContext (2 samples, 0.01%)</title><rect x="954.4" y="2037" width="0.2" height="15.0" fill="rgb(214,17,25)" rx="2" ry="2" />
+<text  x="957.44" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="1055.7" y="1989" width="0.9" height="15.0" fill="rgb(235,216,10)" rx="2" ry="2" />
+<text  x="1058.73" y="1999.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (325 samples, 2.33%)</title><rect x="1104.8" y="2053" width="27.6" height="15.0" fill="rgb(217,21,29)" rx="2" ry="2" />
+<text  x="1107.81" y="2063.5" >_..</text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::LT (10 samples, 0.07%)</title><rect x="976.0" y="2005" width="0.8" height="15.0" fill="rgb(251,123,12)" rx="2" ry="2" />
+<text  x="978.97" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::LA (57 samples, 0.41%)</title><rect x="509.3" y="2005" width="4.9" height="15.0" fill="rgb(230,83,35)" rx="2" ry="2" />
+<text  x="512.34" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::~ANTLRInputStream (89 samples, 0.64%)</title><rect x="455.3" y="2037" width="7.5" height="15.0" fill="rgb(230,228,26)" rx="2" ry="2" />
+<text  x="458.27" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::seek (43 samples, 0.31%)</title><rect x="459.2" y="2005" width="3.6" height="15.0" fill="rgb(209,223,11)" rx="2" ry="2" />
+<text  x="462.16" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="837" width="0.6" height="15.0" fill="rgb(242,169,22)" rx="2" ry="2" />
+<text  x="221.27" y="847.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FullColumnNameContext::~FullColumnNameContext (2 samples, 0.01%)</title><rect x="324.4" y="2021" width="0.2" height="15.0" fill="rgb(205,145,13)" rx="2" ry="2" />
+<text  x="327.39" y="2031.5" ></text>
+</g>
+<g >
+<title>malloc (7 samples, 0.05%)</title><rect x="1018.2" y="2005" width="0.6" height="15.0" fill="rgb(222,44,38)" rx="2" ry="2" />
+<text  x="1021.18" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::release (5 samples, 0.04%)</title><rect x="572.9" y="2005" width="0.4" height="15.0" fill="rgb(212,191,3)" rx="2" ry="2" />
+<text  x="575.92" y="2015.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_unlock (655 samples, 4.71%)</title><rect x="225.6" y="2021" width="55.5" height="15.0" fill="rgb(232,35,4)" rx="2" ry="2" />
+<text  x="228.55" y="2031.5" >__pth..</text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="955.1" y="2021" width="0.4" height="15.0" fill="rgb(233,109,47)" rx="2" ry="2" />
+<text  x="958.12" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="1039.5" y="2021" width="1.0" height="15.0" fill="rgb(228,52,43)" rx="2" ry="2" />
+<text  x="1042.54" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="997" width="0.6" height="15.0" fill="rgb(215,116,39)" rx="2" ry="2" />
+<text  x="221.27" y="1007.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1205" width="0.6" height="15.0" fill="rgb(236,99,30)" rx="2" ry="2" />
+<text  x="221.27" y="1215.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="284.1" y="1829" width="0.4" height="15.0" fill="rgb(248,224,54)" rx="2" ry="2" />
+<text  x="287.13" y="1839.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::~RuleContext (5 samples, 0.04%)</title><rect x="564.0" y="2037" width="0.4" height="15.0" fill="rgb(243,224,23)" rx="2" ry="2" />
+<text  x="567.02" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="566.0" y="2021" width="0.1" height="15.0" fill="rgb(218,140,9)" rx="2" ry="2" />
+<text  x="568.97" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="293" width="0.6" height="15.0" fill="rgb(208,189,44)" rx="2" ry="2" />
+<text  x="221.27" y="303.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="563.7" y="2021" width="0.3" height="15.0" fill="rgb(234,209,28)" rx="2" ry="2" />
+<text  x="566.68" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="469" width="0.6" height="15.0" fill="rgb(220,224,54)" rx="2" ry="2" />
+<text  x="221.27" y="479.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::consume (6 samples, 0.04%)</title><rect x="1132.5" y="2053" width="0.5" height="15.0" fill="rgb(231,35,4)" rx="2" ry="2" />
+<text  x="1135.53" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (5 samples, 0.04%)</title><rect x="953.3" y="2005" width="0.4" height="15.0" fill="rgb(247,159,34)" rx="2" ry="2" />
+<text  x="956.25" y="2015.5" ></text>
+</g>
+<g >
+<title>tick_sched_timer (3 samples, 0.02%)</title><rect x="454.6" y="1957" width="0.2" height="15.0" fill="rgb(231,63,50)" rx="2" ry="2" />
+<text  x="457.59" y="1967.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::execATN (565 samples, 4.06%)</title><rect x="645.0" y="1989" width="47.9" height="15.0" fill="rgb(232,211,30)" rx="2" ry="2" />
+<text  x="647.97" y="1999.5" >antl..</text>
+</g>
+<g >
+<title>antlr4::Parser::exitRule (2 samples, 0.01%)</title><rect x="951.0" y="2005" width="0.1" height="15.0" fill="rgb(222,57,8)" rx="2" ry="2" />
+<text  x="953.97" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FullColumnNameExpressionAtomContext::~FullColumnNameExpressionAtomContext (8 samples, 0.06%)</title><rect x="953.2" y="2037" width="0.6" height="15.0" fill="rgb(221,2,54)" rx="2" ry="2" />
+<text  x="956.17" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1573" width="0.8" height="15.0" fill="rgb(225,106,14)" rx="2" ry="2" />
+<text  x="221.18" y="1583.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="757" width="0.6" height="15.0" fill="rgb(251,127,22)" rx="2" ry="2" />
+<text  x="221.27" y="767.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (11 samples, 0.08%)</title><rect x="1041.3" y="2005" width="1.0" height="15.0" fill="rgb(214,34,43)" rx="2" ry="2" />
+<text  x="1044.32" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (5 samples, 0.04%)</title><rect x="222.0" y="1989" width="0.4" height="15.0" fill="rgb(233,92,7)" rx="2" ry="2" />
+<text  x="224.99" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::functionArgs (3 samples, 0.02%)</title><rect x="1028.2" y="2005" width="0.2" height="15.0" fill="rgb(234,71,19)" rx="2" ry="2" />
+<text  x="1031.19" y="2015.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="769.7" y="1973" width="0.3" height="15.0" fill="rgb(224,217,48)" rx="2" ry="2" />
+<text  x="772.66" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::RootContext::~RootContext (3 samples, 0.02%)</title><rect x="327.0" y="2021" width="0.3" height="15.0" fill="rgb(212,213,23)" rx="2" ry="2" />
+<text  x="330.02" y="2031.5" ></text>
+</g>
+<g >
+<title>handle_irq_event_percpu (2 samples, 0.01%)</title><rect x="1104.6" y="1957" width="0.2" height="15.0" fill="rgb(224,59,32)" rx="2" ry="2" />
+<text  x="1107.64" y="1967.5" ></text>
+</g>
+<g >
+<title>operator delete (7 samples, 0.05%)</title><rect x="710.6" y="2005" width="0.6" height="15.0" fill="rgb(215,27,30)" rx="2" ry="2" />
+<text  x="713.57" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::dfa::DFA::getPrecedenceStartState (79 samples, 0.57%)</title><rect x="698.0" y="2005" width="6.7" height="15.0" fill="rgb(236,164,27)" rx="2" ry="2" />
+<text  x="701.03" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::QuerySpecificationContext::~QuerySpecificationContext (2 samples, 0.01%)</title><rect x="956.4" y="2037" width="0.2" height="15.0" fill="rgb(243,148,10)" rx="2" ry="2" />
+<text  x="959.39" y="2047.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (3 samples, 0.02%)</title><rect x="1060.4" y="1973" width="0.3" height="15.0" fill="rgb(207,143,46)" rx="2" ry="2" />
+<text  x="1063.40" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::UdfFunctionCallContext::~UdfFunctionCallContext (2 samples, 0.01%)</title><rect x="959.9" y="2037" width="0.1" height="15.0" fill="rgb(206,151,43)" rx="2" ry="2" />
+<text  x="962.87" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="955.7" y="2021" width="0.7" height="15.0" fill="rgb(216,15,26)" rx="2" ry="2" />
+<text  x="958.71" y="2031.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (4 samples, 0.03%)</title><rect x="769.7" y="1989" width="0.3" height="15.0" fill="rgb(245,132,39)" rx="2" ry="2" />
+<text  x="772.66" y="1999.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (4 samples, 0.03%)</title><rect x="220.3" y="1973" width="0.3" height="15.0" fill="rgb(226,197,41)" rx="2" ry="2" />
+<text  x="223.30" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::LikePredicateContext::~LikePredicateContext (4 samples, 0.03%)</title><rect x="325.3" y="2021" width="0.4" height="15.0" fill="rgb(248,135,22)" rx="2" ry="2" />
+<text  x="328.32" y="2031.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (49 samples, 0.35%)</title><rect x="208.3" y="2021" width="4.2" height="15.0" fill="rgb(230,101,0)" rx="2" ry="2" />
+<text  x="211.35" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="954.4" y="2021" width="0.2" height="15.0" fill="rgb(207,223,21)" rx="2" ry="2" />
+<text  x="957.44" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,274 samples, 9.15%)</title><rect x="607.0" y="2021" width="108.0" height="15.0" fill="rgb(224,145,27)" rx="2" ry="2" />
+<text  x="609.99" y="2031.5" >[unknown]</text>
+</g>
+<g >
+<title>__dynamic_cast (12 samples, 0.09%)</title><rect x="1042.4" y="2005" width="1.0" height="15.0" fill="rgb(236,148,7)" rx="2" ry="2" />
+<text  x="1045.43" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::load (2 samples, 0.01%)</title><rect x="459.0" y="2005" width="0.2" height="15.0" fill="rgb(254,72,14)" rx="2" ry="2" />
+<text  x="462.00" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FullColumnNameExpressionAtomContext::~FullColumnNameExpressionAtomContext (4 samples, 0.03%)</title><rect x="324.6" y="2021" width="0.3" height="15.0" fill="rgb(218,164,27)" rx="2" ry="2" />
+<text  x="327.56" y="2031.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (19 samples, 0.14%)</title><rect x="1187.5" y="2053" width="1.6" height="15.0" fill="rgb(247,135,26)" rx="2" ry="2" />
+<text  x="1190.46" y="2063.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::LA (10 samples, 0.07%)</title><rect x="639.6" y="1989" width="0.9" height="15.0" fill="rgb(211,46,20)" rx="2" ry="2" />
+<text  x="642.63" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="709" width="0.6" height="15.0" fill="rgb(214,155,19)" rx="2" ry="2" />
+<text  x="221.27" y="719.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::ParserATNSimulator::adaptivePredict (19 samples, 0.14%)</title><rect x="711.9" y="2005" width="1.6" height="15.0" fill="rgb(235,46,51)" rx="2" ry="2" />
+<text  x="714.93" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__exception_ptr::exception_ptr::exception_ptr (2 samples, 0.01%)</title><rect x="1035.7" y="2005" width="0.2" height="15.0" fill="rgb(233,228,46)" rx="2" ry="2" />
+<text  x="1038.73" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::stringLiteral (3 samples, 0.02%)</title><rect x="1032.8" y="2005" width="0.3" height="15.0" fill="rgb(229,189,25)" rx="2" ry="2" />
+<text  x="1035.85" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__exception_ptr::exception_ptr::~exception_ptr (6 samples, 0.04%)</title><rect x="563.2" y="2005" width="0.5" height="15.0" fill="rgb(242,2,0)" rx="2" ry="2" />
+<text  x="566.17" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (26 samples, 0.19%)</title><rect x="964.4" y="2005" width="2.2" height="15.0" fill="rgb(212,146,30)" rx="2" ry="2" />
+<text  x="967.44" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__codecvt_utf8_base&lt;char32_t&gt;::do_in (4 samples, 0.03%)</title><rect x="283.5" y="2005" width="0.4" height="15.0" fill="rgb(249,40,1)" rx="2" ry="2" />
+<text  x="286.53" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::adaptivePredict (10 samples, 0.07%)</title><rect x="1005.0" y="2005" width="0.9" height="15.0" fill="rgb(225,179,2)" rx="2" ry="2" />
+<text  x="1008.04" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (48 samples, 0.34%)</title><rect x="608.2" y="2005" width="4.0" height="15.0" fill="rgb(210,187,38)" rx="2" ry="2" />
+<text  x="611.18" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::SemanticContext::PrecedencePredicate::eval (5 samples, 0.04%)</title><rect x="715.0" y="2037" width="0.4" height="15.0" fill="rgb(254,27,1)" rx="2" ry="2" />
+<text  x="717.98" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1701" width="0.8" height="15.0" fill="rgb(209,7,42)" rx="2" ry="2" />
+<text  x="221.18" y="1711.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="373" width="0.6" height="15.0" fill="rgb(224,146,44)" rx="2" ry="2" />
+<text  x="221.27" y="383.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (3 samples, 0.02%)</title><rect x="218.6" y="37" width="0.3" height="15.0" fill="rgb(245,131,44)" rx="2" ry="2" />
+<text  x="221.60" y="47.5" ></text>
+</g>
+<g >
+<title>cfree (8 samples, 0.06%)</title><rect x="479.3" y="1989" width="0.6" height="15.0" fill="rgb(206,206,29)" rx="2" ry="2" />
+<text  x="482.25" y="1999.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="284.1" y="1861" width="0.4" height="15.0" fill="rgb(245,180,6)" rx="2" ry="2" />
+<text  x="287.13" y="1871.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (3 samples, 0.02%)</title><rect x="584.8" y="1989" width="0.2" height="15.0" fill="rgb(215,198,26)" rx="2" ry="2" />
+<text  x="587.78" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::RuleContext (4 samples, 0.03%)</title><rect x="997.8" y="2005" width="0.3" height="15.0" fill="rgb(229,211,1)" rx="2" ry="2" />
+<text  x="1000.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (17 samples, 0.12%)</title><rect x="957.5" y="2021" width="1.4" height="15.0" fill="rgb(226,15,53)" rx="2" ry="2" />
+<text  x="960.49" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (39 samples, 0.28%)</title><rect x="560.4" y="2021" width="3.3" height="15.0" fill="rgb(239,59,27)" rx="2" ry="2" />
+<text  x="563.37" y="2031.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="769.7" y="1909" width="0.3" height="15.0" fill="rgb(247,212,47)" rx="2" ry="2" />
+<text  x="772.66" y="1919.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::nextTokenOnChannel (12 samples, 0.09%)</title><rect x="643.5" y="1989" width="1.0" height="15.0" fill="rgb(251,156,24)" rx="2" ry="2" />
+<text  x="646.53" y="1999.5" ></text>
+</g>
+<g >
+<title>operator delete (2 samples, 0.01%)</title><rect x="1018.8" y="2005" width="0.1" height="15.0" fill="rgb(232,198,33)" rx="2" ry="2" />
+<text  x="1021.78" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenFactory::create (18 samples, 0.13%)</title><rect x="507.4" y="2037" width="1.5" height="15.0" fill="rgb(206,4,42)" rx="2" ry="2" />
+<text  x="510.40" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::index (2 samples, 0.01%)</title><rect x="454.9" y="2037" width="0.2" height="15.0" fill="rgb(217,160,17)" rx="2" ry="2" />
+<text  x="457.93" y="2047.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="957.5" y="2005" width="0.2" height="15.0" fill="rgb(232,48,13)" rx="2" ry="2" />
+<text  x="960.49" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="693" width="0.6" height="15.0" fill="rgb(230,197,7)" rx="2" ry="2" />
+<text  x="221.27" y="703.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1317" width="0.6" height="15.0" fill="rgb(228,41,24)" rx="2" ry="2" />
+<text  x="221.27" y="1327.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="331.6" y="2021" width="0.5" height="15.0" fill="rgb(231,119,37)" rx="2" ry="2" />
+<text  x="334.59" y="2031.5" ></text>
+</g>
+<g >
+<title>malloc (10 samples, 0.07%)</title><rect x="947.5" y="2037" width="0.8" height="15.0" fill="rgb(250,55,1)" rx="2" ry="2" />
+<text  x="950.49" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::tableName (2 samples, 0.01%)</title><rect x="1033.1" y="2005" width="0.2" height="15.0" fill="rgb(206,73,44)" rx="2" ry="2" />
+<text  x="1036.10" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1269" width="0.6" height="15.0" fill="rgb(207,155,10)" rx="2" ry="2" />
+<text  x="221.27" y="1279.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::~BufferedTokenStream (117 samples, 0.84%)</title><rect x="463.0" y="2037" width="9.9" height="15.0" fill="rgb(240,34,24)" rx="2" ry="2" />
+<text  x="465.98" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::Recognizer::InitializeInstanceFields (2 samples, 0.01%)</title><rect x="563.8" y="2005" width="0.2" height="15.0" fill="rgb(221,201,8)" rx="2" ry="2" />
+<text  x="566.85" y="2015.5" ></text>
+</g>
+<g >
+<title>ctx_resched (4 samples, 0.03%)</title><rect x="1189.7" y="1909" width="0.3" height="15.0" fill="rgb(242,155,52)" rx="2" ry="2" />
+<text  x="1192.66" y="1919.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::ParseTree::ParseTree (2 samples, 0.01%)</title><rect x="292.7" y="2021" width="0.2" height="15.0" fill="rgb(235,41,8)" rx="2" ry="2" />
+<text  x="295.69" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="389" width="0.6" height="15.0" fill="rgb(240,180,35)" rx="2" ry="2" />
+<text  x="221.27" y="399.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (19 samples, 0.14%)</title><rect x="558.3" y="2021" width="1.6" height="15.0" fill="rgb(243,136,10)" rx="2" ry="2" />
+<text  x="561.25" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="101" width="0.6" height="15.0" fill="rgb(219,39,3)" rx="2" ry="2" />
+<text  x="221.27" y="111.5" ></text>
+</g>
+<g >
+<title>antlr4::ParserRuleContext::copyFrom (2 samples, 0.01%)</title><rect x="953.7" y="2005" width="0.1" height="15.0" fill="rgb(237,106,9)" rx="2" ry="2" />
+<text  x="956.68" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::createTerminalNode (2 samples, 0.01%)</title><rect x="957.7" y="2005" width="0.2" height="15.0" fill="rgb(214,73,28)" rx="2" ry="2" />
+<text  x="960.75" y="2015.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (31 samples, 0.22%)</title><rect x="541.0" y="2021" width="2.6" height="15.0" fill="rgb(231,70,32)" rx="2" ry="2" />
+<text  x="543.96" y="2031.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (2 samples, 0.01%)</title><rect x="1042.3" y="2005" width="0.1" height="15.0" fill="rgb(226,180,14)" rx="2" ry="2" />
+<text  x="1045.26" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::LikePredicateContext::LikePredicateContext (3 samples, 0.02%)</title><rect x="1021.1" y="2005" width="0.2" height="15.0" fill="rgb(215,185,9)" rx="2" ry="2" />
+<text  x="1024.07" y="2015.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.01%)</title><rect x="395.6" y="2021" width="0.2" height="15.0" fill="rgb(223,69,20)" rx="2" ry="2" />
+<text  x="398.59" y="2031.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (4 samples, 0.03%)</title><rect x="221.3" y="1989" width="0.4" height="15.0" fill="rgb(222,74,36)" rx="2" ry="2" />
+<text  x="224.32" y="1999.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (11 samples, 0.08%)</title><rect x="1014.9" y="2005" width="0.9" height="15.0" fill="rgb(206,130,18)" rx="2" ry="2" />
+<text  x="1017.88" y="2015.5" ></text>
+</g>
+<g >
+<title>handle_edge_irq (2 samples, 0.01%)</title><rect x="1104.6" y="1989" width="0.2" height="15.0" fill="rgb(225,142,49)" rx="2" ry="2" />
+<text  x="1107.64" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::nextToken (4 samples, 0.03%)</title><rect x="559.9" y="2037" width="0.3" height="15.0" fill="rgb(247,206,47)" rx="2" ry="2" />
+<text  x="562.86" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="341" width="0.6" height="15.0" fill="rgb(208,207,48)" rx="2" ry="2" />
+<text  x="221.27" y="351.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1381" width="0.6" height="15.0" fill="rgb(224,140,17)" rx="2" ry="2" />
+<text  x="221.27" y="1391.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1525" width="0.6" height="15.0" fill="rgb(242,39,41)" rx="2" ry="2" />
+<text  x="221.27" y="1535.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::Lexer::nextToken (41 samples, 0.29%)</title><rect x="455.4" y="1989" width="3.5" height="15.0" fill="rgb(233,41,4)" rx="2" ry="2" />
+<text  x="458.43" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ComparisonOperatorContext::~ComparisonOperatorContext (4 samples, 0.03%)</title><rect x="950.5" y="2037" width="0.4" height="15.0" fill="rgb(240,173,26)" rx="2" ry="2" />
+<text  x="953.54" y="2047.5" ></text>
+</g>
+<g >
+<title>__popcountdi2 (13 samples, 0.09%)</title><rect x="629.6" y="1989" width="1.1" height="15.0" fill="rgb(245,43,32)" rx="2" ry="2" />
+<text  x="632.63" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::computeTargetState (4 samples, 0.03%)</title><rect x="566.1" y="2037" width="0.4" height="15.0" fill="rgb(235,70,0)" rx="2" ry="2" />
+<text  x="569.14" y="2047.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="1189.7" y="1845" width="0.3" height="15.0" fill="rgb(217,213,8)" rx="2" ry="2" />
+<text  x="1192.66" y="1855.5" ></text>
+</g>
+<g >
+<title>antlr4::RuleContext::setAltNumber (20 samples, 0.14%)</title><rect x="998.1" y="2005" width="1.7" height="15.0" fill="rgb(229,215,15)" rx="2" ry="2" />
+<text  x="1001.09" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (117 samples, 0.84%)</title><rect x="1043.8" y="2005" width="9.9" height="15.0" fill="rgb(223,15,43)" rx="2" ry="2" />
+<text  x="1046.78" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1589" width="0.8" height="15.0" fill="rgb(235,142,2)" rx="2" ry="2" />
+<text  x="221.18" y="1599.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="1055.7" y="2021" width="0.9" height="15.0" fill="rgb(227,132,8)" rx="2" ry="2" />
+<text  x="1058.73" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::execATN (1,211 samples, 8.70%)</title><rect x="790.0" y="2005" width="102.6" height="15.0" fill="rgb(212,70,34)" rx="2" ry="2" />
+<text  x="793.00" y="2015.5" >antlr4::atn:..</text>
+</g>
+<g >
+<title>__cxxabiv1::__class_type_info::__do_dyncast (5 samples, 0.04%)</title><rect x="1060.7" y="2053" width="0.4" height="15.0" fill="rgb(244,188,25)" rx="2" ry="2" />
+<text  x="1063.65" y="2063.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ConstantContext::~ConstantContext (3 samples, 0.02%)</title><rect x="322.5" y="2021" width="0.3" height="15.0" fill="rgb(220,84,8)" rx="2" ry="2" />
+<text  x="325.52" y="2031.5" ></text>
+</g>
+<g >
+<title>operator new (4 samples, 0.03%)</title><rect x="600.0" y="1989" width="0.3" height="15.0" fill="rgb(217,83,52)" rx="2" ry="2" />
+<text  x="602.96" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1637" width="0.8" height="15.0" fill="rgb(247,111,24)" rx="2" ry="2" />
+<text  x="221.18" y="1647.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::Lexer (4 samples, 0.03%)</title><rect x="285.7" y="2021" width="0.3" height="15.0" fill="rgb(230,191,43)" rx="2" ry="2" />
+<text  x="288.65" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="133" width="0.6" height="15.0" fill="rgb(234,34,33)" rx="2" ry="2" />
+<text  x="221.27" y="143.5" ></text>
+</g>
+<g >
+<title>antlr4::Parser::createTerminalNode (2 samples, 0.01%)</title><rect x="949.8" y="2005" width="0.1" height="15.0" fill="rgb(247,180,53)" rx="2" ry="2" />
+<text  x="952.78" y="2015.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (6 samples, 0.04%)</title><rect x="946.4" y="2037" width="0.5" height="15.0" fill="rgb(242,30,4)" rx="2" ry="2" />
+<text  x="949.39" y="2047.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;antlr4::tree::ParseTree*, std::allocator&lt;antlr4::tree::ParseTree*&gt; &gt;::_M_realloc_insert&lt;antlr4::tree::ParseTree*&gt; (4 samples, 0.03%)</title><rect x="958.3" y="2005" width="0.4" height="15.0" fill="rgb(235,189,16)" rx="2" ry="2" />
+<text  x="961.34" y="2015.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="606.7" y="2005" width="0.3" height="15.0" fill="rgb(241,168,39)" rx="2" ry="2" />
+<text  x="609.65" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerChannelAction::execute (4 samples, 0.03%)</title><rect x="1053.7" y="2005" width="0.3" height="15.0" fill="rgb(226,28,23)" rx="2" ry="2" />
+<text  x="1056.70" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="958.9" y="2021" width="0.3" height="15.0" fill="rgb(211,63,20)" rx="2" ry="2" />
+<text  x="961.93" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SqlStatementContext::~SqlStatementContext (2 samples, 0.01%)</title><rect x="959.2" y="2037" width="0.2" height="15.0" fill="rgb(216,168,2)" rx="2" ry="2" />
+<text  x="962.19" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (4 samples, 0.03%)</title><rect x="716.5" y="1989" width="0.3" height="15.0" fill="rgb(242,136,54)" rx="2" ry="2" />
+<text  x="719.51" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenStream::adjustSeekIndex (2 samples, 0.01%)</title><rect x="644.8" y="1989" width="0.2" height="15.0" fill="rgb(213,59,41)" rx="2" ry="2" />
+<text  x="647.80" y="1999.5" ></text>
+</g>
+<g >
+<title>std::_Function_handler&lt;void  (15 samples, 0.11%)</title><rect x="603.5" y="2005" width="1.3" height="15.0" fill="rgb(251,25,47)" rx="2" ry="2" />
+<text  x="606.52" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::NestedExpressionAtomContext::~NestedExpressionAtomContext (3 samples, 0.02%)</title><rect x="955.5" y="2037" width="0.2" height="15.0" fill="rgb(206,221,37)" rx="2" ry="2" />
+<text  x="958.46" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::RootContext::~RootContext (9 samples, 0.06%)</title><rect x="956.6" y="2037" width="0.7" height="15.0" fill="rgb(222,136,24)" rx="2" ry="2" />
+<text  x="959.56" y="2047.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="1189.7" y="1893" width="0.3" height="15.0" fill="rgb(238,209,21)" rx="2" ry="2" />
+<text  x="1192.66" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (22 samples, 0.16%)</title><rect x="218.1" y="1973" width="1.9" height="15.0" fill="rgb(239,59,46)" rx="2" ry="2" />
+<text  x="221.10" y="1983.5" ></text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::setParent (3 samples, 0.02%)</title><rect x="950.6" y="2005" width="0.3" height="15.0" fill="rgb(230,102,39)" rx="2" ry="2" />
+<text  x="953.63" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="677" width="0.6" height="15.0" fill="rgb(232,136,26)" rx="2" ry="2" />
+<text  x="221.27" y="687.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1333" width="0.6" height="15.0" fill="rgb(221,66,21)" rx="2" ry="2" />
+<text  x="221.27" y="1343.5" ></text>
+</g>
+<g >
+<title>do_IRQ (2 samples, 0.01%)</title><rect x="1104.6" y="2021" width="0.2" height="15.0" fill="rgb(206,162,21)" rx="2" ry="2" />
+<text  x="1107.64" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::fill (30 samples, 0.22%)</title><rect x="1134.5" y="2053" width="2.5" height="15.0" fill="rgb(247,110,30)" rx="2" ry="2" />
+<text  x="1137.48" y="2063.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (22 samples, 0.16%)</title><rect x="281.2" y="2005" width="1.9" height="15.0" fill="rgb(248,12,36)" rx="2" ry="2" />
+<text  x="284.24" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (5 samples, 0.04%)</title><rect x="508.9" y="2005" width="0.4" height="15.0" fill="rgb(237,207,38)" rx="2" ry="2" />
+<text  x="511.92" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::ParserATNSimulator::adaptivePredict (864 samples, 6.21%)</title><rect x="623.3" y="2005" width="73.2" height="15.0" fill="rgb(216,194,13)" rx="2" ry="2" />
+<text  x="626.27" y="2015.5" >antlr4::..</text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::~TerminalNodeImpl (8 samples, 0.06%)</title><rect x="330.3" y="2021" width="0.7" height="15.0" fill="rgb(244,108,52)" rx="2" ry="2" />
+<text  x="333.32" y="2031.5" ></text>
+</g>
+<g >
+<title>ret_from_intr (2 samples, 0.01%)</title><rect x="1104.6" y="2037" width="0.2" height="15.0" fill="rgb(225,17,22)" rx="2" ry="2" />
+<text  x="1107.64" y="2047.5" ></text>
+</g>
+<g >
+<title>handle_irq_event (2 samples, 0.01%)</title><rect x="1104.6" y="1973" width="0.2" height="15.0" fill="rgb(244,167,21)" rx="2" ry="2" />
+<text  x="1107.64" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="954.7" y="2021" width="0.2" height="15.0" fill="rgb(232,129,6)" rx="2" ry="2" />
+<text  x="957.70" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (11 samples, 0.08%)</title><rect x="218.2" y="1909" width="0.9" height="15.0" fill="rgb(244,81,44)" rx="2" ry="2" />
+<text  x="221.18" y="1919.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::MathExpressionAtomContext::~MathExpressionAtomContext (3 samples, 0.02%)</title><rect x="954.9" y="2037" width="0.2" height="15.0" fill="rgb(213,147,28)" rx="2" ry="2" />
+<text  x="957.86" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1781" width="0.8" height="15.0" fill="rgb(247,173,34)" rx="2" ry="2" />
+<text  x="221.18" y="1791.5" ></text>
+</g>
+<g >
+<title>operator new (8 samples, 0.06%)</title><rect x="948.3" y="2037" width="0.7" height="15.0" fill="rgb(231,77,0)" rx="2" ry="2" />
+<text  x="951.34" y="2047.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (8 samples, 0.06%)</title><rect x="614.3" y="1973" width="0.7" height="15.0" fill="rgb(227,90,41)" rx="2" ry="2" />
+<text  x="617.28" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="613" width="0.6" height="15.0" fill="rgb(248,187,24)" rx="2" ry="2" />
+<text  x="221.27" y="623.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (2 samples, 0.01%)</title><rect x="1041.1" y="1973" width="0.1" height="15.0" fill="rgb(248,68,36)" rx="2" ry="2" />
+<text  x="1044.07" y="1983.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerActionExecutor::execute (19 samples, 0.14%)</title><rect x="598.1" y="1989" width="1.6" height="15.0" fill="rgb(232,82,51)" rx="2" ry="2" />
+<text  x="601.09" y="1999.5" ></text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (13 samples, 0.09%)</title><rect x="1185.2" y="2053" width="1.1" height="15.0" fill="rgb(239,120,31)" rx="2" ry="2" />
+<text  x="1188.17" y="2063.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="1189.7" y="1861" width="0.3" height="15.0" fill="rgb(254,167,8)" rx="2" ry="2" />
+<text  x="1192.66" y="1871.5" ></text>
+</g>
+<g >
+<title>antlr4::ANTLRInputStream::mark (5 samples, 0.04%)</title><rect x="475.3" y="1989" width="0.4" height="15.0" fill="rgb(217,210,34)" rx="2" ry="2" />
+<text  x="478.27" y="1999.5" ></text>
+</g>
+<g >
+<title>antlrcpp::finally (2 samples, 0.01%)</title><rect x="219.5" y="1957" width="0.1" height="15.0" fill="rgb(216,124,26)" rx="2" ry="2" />
+<text  x="222.45" y="1967.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ExpressionAtomContext::~ExpressionAtomContext (4 samples, 0.03%)</title><rect x="323.5" y="2021" width="0.4" height="15.0" fill="rgb(253,106,9)" rx="2" ry="2" />
+<text  x="326.54" y="2031.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="606.7" y="1925" width="0.3" height="15.0" fill="rgb(240,57,27)" rx="2" ry="2" />
+<text  x="609.65" y="1935.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ExpressionContext::~ExpressionContext (6 samples, 0.04%)</title><rect x="323.9" y="2021" width="0.5" height="15.0" fill="rgb(210,47,2)" rx="2" ry="2" />
+<text  x="326.88" y="2031.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="769.7" y="1957" width="0.3" height="15.0" fill="rgb(207,77,31)" rx="2" ry="2" />
+<text  x="772.66" y="1967.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlLexer::~MySqlLexer (2 samples, 0.01%)</title><rect x="321.8" y="2021" width="0.1" height="15.0" fill="rgb(233,194,52)" rx="2" ry="2" />
+<text  x="324.76" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="357" width="0.6" height="15.0" fill="rgb(247,102,2)" rx="2" ry="2" />
+<text  x="221.27" y="367.5" ></text>
+</g>
+<g >
+<title>benchmark (13,917 samples, 99.97%)</title><rect x="10.0" y="2069" width="1179.7" height="15.0" fill="rgb(228,31,44)" rx="2" ry="2" />
+<text  x="13.00" y="2079.5" >benchmark</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="949.5" y="2021" width="0.2" height="15.0" fill="rgb(220,135,47)" rx="2" ry="2" />
+<text  x="952.52" y="2031.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::DecimalLiteralContext::~DecimalLiteralContext (3 samples, 0.02%)</title><rect x="322.9" y="2021" width="0.2" height="15.0" fill="rgb(224,201,23)" rx="2" ry="2" />
+<text  x="325.86" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::~LexerATNSimulator (452 samples, 3.25%)</title><rect x="566.5" y="2037" width="38.3" height="15.0" fill="rgb(236,139,34)" rx="2" ry="2" />
+<text  x="569.48" y="2047.5" >ant..</text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="917" width="0.6" height="15.0" fill="rgb(231,202,25)" rx="2" ry="2" />
+<text  x="221.27" y="927.5" ></text>
+</g>
+<g >
+<title>[unknown] (9 samples, 0.06%)</title><rect x="218.2" y="1557" width="0.7" height="15.0" fill="rgb(224,22,0)" rx="2" ry="2" />
+<text  x="221.18" y="1567.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::CaseFunctionCallContext::~CaseFunctionCallContext (3 samples, 0.02%)</title><rect x="322.3" y="2021" width="0.2" height="15.0" fill="rgb(226,153,29)" rx="2" ry="2" />
+<text  x="325.27" y="2031.5" ></text>
+</g>
+<g >
+<title>perf (4 samples, 0.03%)</title><rect x="1189.7" y="2069" width="0.3" height="15.0" fill="rgb(207,53,28)" rx="2" ry="2" />
+<text  x="1192.66" y="2079.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (2 samples, 0.01%)</title><rect x="217.9" y="1973" width="0.2" height="15.0" fill="rgb(240,105,52)" rx="2" ry="2" />
+<text  x="220.93" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="277" width="0.6" height="15.0" fill="rgb(242,211,28)" rx="2" ry="2" />
+<text  x="221.27" y="287.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::~MySqlParser (911 samples, 6.54%)</title><rect x="960.1" y="2037" width="77.2" height="15.0" fill="rgb(239,29,40)" rx="2" ry="2" />
+<text  x="963.12" y="2047.5" >parsers:..</text>
+</g>
+<g >
+<title>[unknown] (89 samples, 0.64%)</title><rect x="455.3" y="2021" width="7.5" height="15.0" fill="rgb(253,192,27)" rx="2" ry="2" />
+<text  x="458.27" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1077" width="0.6" height="15.0" fill="rgb(249,59,8)" rx="2" ry="2" />
+<text  x="221.27" y="1087.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (2 samples, 0.01%)</title><rect x="565.5" y="1989" width="0.1" height="15.0" fill="rgb(254,88,18)" rx="2" ry="2" />
+<text  x="568.46" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNConfig::~LexerATNConfig (2 samples, 0.01%)</title><rect x="566.0" y="2037" width="0.1" height="15.0" fill="rgb(246,27,48)" rx="2" ry="2" />
+<text  x="568.97" y="2047.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::ExpressionAtomPredicateContext::~ExpressionAtomPredicateContext (7 samples, 0.05%)</title><rect x="952.1" y="2037" width="0.6" height="15.0" fill="rgb(216,181,4)" rx="2" ry="2" />
+<text  x="955.07" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="955.5" y="2021" width="0.2" height="15.0" fill="rgb(233,112,11)" rx="2" ry="2" />
+<text  x="958.46" y="2031.5" ></text>
+</g>
+<g >
+<title>update_process_times (2 samples, 0.01%)</title><rect x="454.7" y="1925" width="0.1" height="15.0" fill="rgb(246,186,2)" rx="2" ry="2" />
+<text  x="457.67" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1141" width="0.6" height="15.0" fill="rgb(209,114,17)" rx="2" ry="2" />
+<text  x="221.27" y="1151.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="485" width="0.6" height="15.0" fill="rgb(243,174,41)" rx="2" ry="2" />
+<text  x="221.27" y="495.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::getReachableConfigSet (15 samples, 0.11%)</title><rect x="605.0" y="1989" width="1.3" height="15.0" fill="rgb(226,212,34)" rx="2" ry="2" />
+<text  x="608.04" y="1999.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (2 samples, 0.01%)</title><rect x="564.0" y="2005" width="0.2" height="15.0" fill="rgb(233,78,13)" rx="2" ry="2" />
+<text  x="567.02" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::MathExpressionAtomContext::~MathExpressionAtomContext (4 samples, 0.03%)</title><rect x="325.7" y="2021" width="0.3" height="15.0" fill="rgb(217,108,32)" rx="2" ry="2" />
+<text  x="328.66" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.01%)</title><rect x="953.8" y="2005" width="0.2" height="15.0" fill="rgb(252,121,1)" rx="2" ry="2" />
+<text  x="956.85" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1349" width="0.6" height="15.0" fill="rgb(240,178,10)" rx="2" ry="2" />
+<text  x="221.27" y="1359.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::AggregateWindowedFunctionContext::~AggregateWindowedFunctionContext (5 samples, 0.04%)</title><rect x="949.7" y="2037" width="0.4" height="15.0" fill="rgb(243,66,3)" rx="2" ry="2" />
+<text  x="952.69" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::nextTokenOnChannel (108 samples, 0.78%)</title><rect x="516.3" y="2005" width="9.2" height="15.0" fill="rgb(222,211,50)" rx="2" ry="2" />
+<text  x="519.30" y="2015.5" ></text>
+</g>
+<g >
+<title>antlr4::atn::LexerATNSimulator::getCharPositionInLine (2 samples, 0.01%)</title><rect x="500.9" y="2005" width="0.1" height="15.0" fill="rgb(244,27,51)" rx="2" ry="2" />
+<text  x="503.87" y="2015.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (67 samples, 0.48%)</title><rect x="716.8" y="2005" width="5.7" height="15.0" fill="rgb(228,191,25)" rx="2" ry="2" />
+<text  x="719.85" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::expressionAtom (24 samples, 0.17%)</title><rect x="1025.6" y="2005" width="2.1" height="15.0" fill="rgb(227,71,24)" rx="2" ry="2" />
+<text  x="1028.64" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;parsers::MySqlParser::simpleId (2 samples, 0.01%)</title><rect x="966.1" y="1989" width="0.2" height="15.0" fill="rgb(206,85,12)" rx="2" ry="2" />
+<text  x="969.14" y="1999.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="769.7" y="1829" width="0.3" height="15.0" fill="rgb(206,60,0)" rx="2" ry="2" />
+<text  x="772.66" y="1839.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::nextTokenOnChannel (15 samples, 0.11%)</title><rect x="1137.1" y="2053" width="1.3" height="15.0" fill="rgb(254,95,38)" rx="2" ry="2" />
+<text  x="1140.11" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="565" width="0.6" height="15.0" fill="rgb(212,224,28)" rx="2" ry="2" />
+<text  x="221.27" y="575.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::getChannel (18 samples, 0.13%)</title><rect x="526.3" y="2005" width="1.5" height="15.0" fill="rgb(232,60,14)" rx="2" ry="2" />
+<text  x="529.30" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (75 samples, 0.54%)</title><rect x="473.7" y="2005" width="6.3" height="15.0" fill="rgb(222,38,19)" rx="2" ry="2" />
+<text  x="476.66" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="1055.7" y="1973" width="0.6" height="15.0" fill="rgb(249,154,8)" rx="2" ry="2" />
+<text  x="1058.73" y="1983.5" ></text>
+</g>
+<g >
+<title>operator new (7 samples, 0.05%)</title><rect x="557.7" y="2021" width="0.6" height="15.0" fill="rgb(218,64,14)" rx="2" ry="2" />
+<text  x="560.66" y="2031.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonToken::CommonToken (4 samples, 0.03%)</title><rect x="220.6" y="1989" width="0.4" height="15.0" fill="rgb(209,25,50)" rx="2" ry="2" />
+<text  x="223.64" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (96 samples, 0.69%)</title><rect x="914.5" y="2037" width="8.2" height="15.0" fill="rgb(236,42,44)" rx="2" ry="2" />
+<text  x="917.52" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.06%)</title><rect x="956.6" y="1989" width="0.6" height="15.0" fill="rgb(219,162,24)" rx="2" ry="2" />
+<text  x="959.56" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1653" width="0.8" height="15.0" fill="rgb(229,110,17)" rx="2" ry="2" />
+<text  x="221.18" y="1663.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::NestedExpressionAtomContext::~NestedExpressionAtomContext (2 samples, 0.01%)</title><rect x="326.0" y="2021" width="0.2" height="15.0" fill="rgb(218,110,2)" rx="2" ry="2" />
+<text  x="329.00" y="2031.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;antlr4::atn::ATNConfig, std::allocator&lt;antlr4::atn::ATNConfig&gt;,  (11 samples, 0.08%)</title><rect x="1039.5" y="2037" width="1.0" height="15.0" fill="rgb(227,137,39)" rx="2" ry="2" />
+<text  x="1042.54" y="2047.5" ></text>
+</g>
+<g >
+<title>antlr4::misc::IntervalSet::IntervalSet (4 samples, 0.03%)</title><rect x="564.8" y="1989" width="0.3" height="15.0" fill="rgb(230,52,36)" rx="2" ry="2" />
+<text  x="567.78" y="1999.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::SelectExpressionElementContext::SelectExpressionElementContext (2 samples, 0.01%)</title><rect x="1021.9" y="2005" width="0.2" height="15.0" fill="rgb(243,67,4)" rx="2" ry="2" />
+<text  x="1024.91" y="2015.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::compare (3 samples, 0.02%)</title><rect x="219.7" y="1957" width="0.3" height="15.0" fill="rgb(236,190,5)" rx="2" ry="2" />
+<text  x="222.71" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (452 samples, 3.25%)</title><rect x="566.5" y="2021" width="38.3" height="15.0" fill="rgb(241,141,10)" rx="2" ry="2" />
+<text  x="569.48" y="2031.5" >[un..</text>
+</g>
+<g >
+<title>[unknown] (32 samples, 0.23%)</title><rect x="217.9" y="1989" width="2.7" height="15.0" fill="rgb(228,128,33)" rx="2" ry="2" />
+<text  x="220.93" y="1999.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="606.7" y="1973" width="0.3" height="15.0" fill="rgb(216,227,53)" rx="2" ry="2" />
+<text  x="609.65" y="1983.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::TableSourceContext::~TableSourceContext (2 samples, 0.01%)</title><rect x="327.8" y="2021" width="0.1" height="15.0" fill="rgb(242,10,41)" rx="2" ry="2" />
+<text  x="330.78" y="2031.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (3 samples, 0.02%)</title><rect x="454.6" y="2021" width="0.2" height="15.0" fill="rgb(208,107,34)" rx="2" ry="2" />
+<text  x="457.59" y="2031.5" ></text>
+</g>
+<g >
+<title>[libantlrsqlparser.so] (13 samples, 0.09%)</title><rect x="628.4" y="1989" width="1.1" height="15.0" fill="rgb(246,16,22)" rx="2" ry="2" />
+<text  x="631.35" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::BufferedTokenStream::previousTokenOnChannel (2 samples, 0.01%)</title><rect x="462.8" y="2037" width="0.2" height="15.0" fill="rgb(205,124,28)" rx="2" ry="2" />
+<text  x="465.81" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.07%)</title><rect x="218.2" y="1669" width="0.8" height="15.0" fill="rgb(244,8,50)" rx="2" ry="2" />
+<text  x="221.18" y="1679.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="965" width="0.6" height="15.0" fill="rgb(224,99,27)" rx="2" ry="2" />
+<text  x="221.27" y="975.5" ></text>
+</g>
+<g >
+<title>antlr4::tree::TerminalNodeImpl::TerminalNodeImpl (6 samples, 0.04%)</title><rect x="501.5" y="2005" width="0.6" height="15.0" fill="rgb(207,202,30)" rx="2" ry="2" />
+<text  x="504.55" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.02%)</title><rect x="1057.1" y="2021" width="0.2" height="15.0" fill="rgb(242,61,14)" rx="2" ry="2" />
+<text  x="1060.09" y="2031.5" ></text>
+</g>
+<g >
+<title>virtual thunk to antlr4::tree::TerminalNodeImpl::setParent (3 samples, 0.02%)</title><rect x="958.7" y="2005" width="0.2" height="15.0" fill="rgb(238,178,7)" rx="2" ry="2" />
+<text  x="961.68" y="2015.5" ></text>
+</g>
+<g >
+<title>std::_Function_base::_Base_manager&lt;antlr4::atn::LexerActionExecutor::execute (3 samples, 0.02%)</title><rect x="331.8" y="1989" width="0.3" height="15.0" fill="rgb(211,216,29)" rx="2" ry="2" />
+<text  x="334.85" y="1999.5" ></text>
+</g>
+<g >
+<title>antlr4::TokenStream::~TokenStream (2 samples, 0.01%)</title><rect x="222.9" y="2005" width="0.2" height="15.0" fill="rgb(232,183,40)" rx="2" ry="2" />
+<text  x="225.93" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (12 samples, 0.09%)</title><rect x="715.4" y="2005" width="1.0" height="15.0" fill="rgb(245,91,37)" rx="2" ry="2" />
+<text  x="718.41" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,450 samples, 10.42%)</title><rect x="208.1" y="2037" width="122.9" height="15.0" fill="rgb(241,174,1)" rx="2" ry="2" />
+<text  x="211.09" y="2047.5" >[unknown]</text>
+</g>
+<g >
+<title>pthread_cond_signal@@GLIBC_2.3.2 (11 samples, 0.08%)</title><rect x="695.2" y="1989" width="1.0" height="15.0" fill="rgb(220,81,33)" rx="2" ry="2" />
+<text  x="698.23" y="1999.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (2 samples, 0.01%)</title><rect x="1055.8" y="1957" width="0.2" height="15.0" fill="rgb(239,156,4)" rx="2" ry="2" />
+<text  x="1058.82" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="1125" width="0.6" height="15.0" fill="rgb(237,151,41)" rx="2" ry="2" />
+<text  x="221.27" y="1135.5" ></text>
+</g>
+<g >
+<title>antlr4::CommonTokenFactory::create (79 samples, 0.57%)</title><rect x="549.6" y="2021" width="6.7" height="15.0" fill="rgb(215,29,9)" rx="2" ry="2" />
+<text  x="552.61" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.05%)</title><rect x="218.3" y="741" width="0.6" height="15.0" fill="rgb(206,102,34)" rx="2" ry="2" />
+<text  x="221.27" y="751.5" ></text>
+</g>
+<g >
+<title>antlr4::Lexer::InitializeInstanceFields (2 samples, 0.01%)</title><rect x="285.5" y="2021" width="0.2" height="15.0" fill="rgb(228,194,37)" rx="2" ry="2" />
+<text  x="288.48" y="2031.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (78 samples, 0.56%)</title><rect x="966.6" y="2005" width="6.7" height="15.0" fill="rgb(221,159,10)" rx="2" ry="2" />
+<text  x="969.65" y="2015.5" ></text>
+</g>
+<g >
+<title>parsers::MySqlParser::FullColumnNameContext::~FullColumnNameContext (4 samples, 0.03%)</title><rect x="952.8" y="2037" width="0.4" height="15.0" fill="rgb(239,74,0)" rx="2" ry="2" />
+<text  x="955.83" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="1060.1" y="2021" width="0.6" height="15.0" fill="rgb(234,141,42)" rx="2" ry="2" />
+<text  x="1063.14" y="2031.5" ></text>
+</g>
+<g >
+<title>cfree (9 samples, 0.06%)</title><rect x="1054.0" y="2005" width="0.8" height="15.0" fill="rgb(230,188,52)" rx="2" ry="2" />
+<text  x="1057.04" y="2015.5" ></text>
+</g>
+</g>
+</svg>

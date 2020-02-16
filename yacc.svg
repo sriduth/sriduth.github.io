@@ -1,0 +1,1592 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="326" onload="init(evt)" viewBox="0 0 1200 326" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+	}
+
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+		}
+		else if (e.target.id == "unzoom") unzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+	}, false)
+
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+		return;
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) {
+				currentSearchTerm = term;
+				search();
+			}
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (currentSearchTerm === null) return;
+		var term = currentSearchTerm;
+
+		var re = new RegExp(term, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="326.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="309" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="309" > </text>
+<g id="frames">
+<g >
+<title>std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt; (28 samples, 0.18%)</title><rect x="1043.3" y="197" width="2.1" height="15.0" fill="rgb(216,87,37)" rx="2" ry="2" />
+<text  x="1046.31" y="207.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="56.2" y="69" width="0.3" height="15.0" fill="rgb(230,212,5)" rx="2" ry="2" />
+<text  x="59.19" y="79.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="368.1" y="181" width="0.3" height="15.0" fill="rgb(212,39,35)" rx="2" ry="2" />
+<text  x="371.12" y="191.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_init (15 samples, 0.09%)</title><rect x="1160.9" y="245" width="1.1" height="15.0" fill="rgb(230,76,16)" rx="2" ry="2" />
+<text  x="1163.87" y="255.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="141.3" y="165" width="0.3" height="15.0" fill="rgb(254,67,12)" rx="2" ry="2" />
+<text  x="144.27" y="175.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_init (6 samples, 0.04%)</title><rect x="1008.1" y="197" width="0.5" height="15.0" fill="rgb(238,160,25)" rx="2" ry="2" />
+<text  x="1011.15" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_parse (35 samples, 0.22%)</title><rect x="386.9" y="149" width="2.6" height="15.0" fill="rgb(210,37,47)" rx="2" ry="2" />
+<text  x="389.89" y="159.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (11 samples, 0.07%)</title><rect x="183.8" y="181" width="0.8" height="15.0" fill="rgb(230,42,28)" rx="2" ry="2" />
+<text  x="186.81" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (28 samples, 0.18%)</title><rect x="355.5" y="213" width="2.0" height="15.0" fill="rgb(216,90,46)" rx="2" ry="2" />
+<text  x="358.45" y="223.5" ></text>
+</g>
+<g >
+<title>operator new (2 samples, 0.01%)</title><rect x="393.4" y="165" width="0.2" height="15.0" fill="rgb(246,11,35)" rx="2" ry="2" />
+<text  x="396.45" y="175.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (6 samples, 0.04%)</title><rect x="211.7" y="197" width="0.5" height="15.0" fill="rgb(236,195,20)" rx="2" ry="2" />
+<text  x="214.75" y="207.5" ></text>
+</g>
+<g >
+<title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn (6 samples, 0.04%)</title><rect x="1160.4" y="245" width="0.5" height="15.0" fill="rgb(250,8,40)" rx="2" ry="2" />
+<text  x="1163.42" y="255.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (65 samples, 0.41%)</title><rect x="172.5" y="197" width="4.8" height="15.0" fill="rgb(249,48,37)" rx="2" ry="2" />
+<text  x="175.48" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (20 samples, 0.13%)</title><rect x="528.2" y="181" width="1.5" height="15.0" fill="rgb(242,213,27)" rx="2" ry="2" />
+<text  x="531.22" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;short, std::allocator&lt;short&gt; &gt;::_M_realloc_insert&lt;short const&amp;&gt; (4 samples, 0.03%)</title><rect x="211.4" y="197" width="0.3" height="15.0" fill="rgb(233,7,34)" rx="2" ry="2" />
+<text  x="214.45" y="207.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="368.1" y="101" width="0.3" height="15.0" fill="rgb(242,218,2)" rx="2" ry="2" />
+<text  x="371.12" y="111.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParser::tokenize (18 samples, 0.11%)</title><rect x="280.9" y="213" width="1.3" height="15.0" fill="rgb(244,50,32)" rx="2" ry="2" />
+<text  x="283.88" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::SelectStatement::~SelectStatement (3 samples, 0.02%)</title><rect x="411.6" y="181" width="0.3" height="15.0" fill="rgb(228,137,37)" rx="2" ry="2" />
+<text  x="414.63" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::TableRef*, std::allocator&lt;hsql::TableRef*&gt; &gt;::_M_realloc_insert&lt;hsql::TableRef* const&amp;&gt; (2 samples, 0.01%)</title><rect x="1031.6" y="229" width="0.2" height="15.0" fill="rgb(238,79,52)" rx="2" ry="2" />
+<text  x="1034.61" y="239.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::init (11 samples, 0.07%)</title><rect x="1007.3" y="197" width="0.8" height="15.0" fill="rgb(244,73,4)" rx="2" ry="2" />
+<text  x="1010.33" y="207.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeCase (2 samples, 0.01%)</title><rect x="381.1" y="229" width="0.1" height="15.0" fill="rgb(225,217,6)" rx="2" ry="2" />
+<text  x="384.08" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (2,737 samples, 17.28%)</title><rect x="153.6" y="229" width="203.9" height="15.0" fill="rgb(251,199,35)" rx="2" ry="2" />
+<text  x="156.64" y="239.5" >[unknown]</text>
+</g>
+<g >
+<title>__strdup (49 samples, 0.31%)</title><rect x="370.3" y="229" width="3.6" height="15.0" fill="rgb(234,100,6)" rx="2" ry="2" />
+<text  x="373.28" y="239.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (3 samples, 0.02%)</title><rect x="386.2" y="165" width="0.2" height="15.0" fill="rgb(230,46,28)" rx="2" ry="2" />
+<text  x="389.22" y="175.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="385.9" y="181" width="0.3" height="15.0" fill="rgb(205,48,26)" rx="2" ry="2" />
+<text  x="388.93" y="191.5" ></text>
+</g>
+<g >
+<title>hsql__delete_buffer (3 samples, 0.02%)</title><rect x="531.3" y="229" width="0.3" height="15.0" fill="rgb(228,134,11)" rx="2" ry="2" />
+<text  x="534.35" y="239.5" ></text>
+</g>
+<g >
+<title>update_process_times (2 samples, 0.01%)</title><rect x="975.2" y="117" width="0.2" height="15.0" fill="rgb(231,40,48)" rx="2" ry="2" />
+<text  x="978.22" y="127.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (152 samples, 0.96%)</title><rect x="161.2" y="213" width="11.3" height="15.0" fill="rgb(216,173,14)" rx="2" ry="2" />
+<text  x="164.16" y="223.5" ></text>
+</g>
+<g >
+<title>hsql_lex (9 samples, 0.06%)</title><rect x="411.9" y="181" width="0.6" height="15.0" fill="rgb(239,225,49)" rx="2" ry="2" />
+<text  x="414.85" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (2 samples, 0.01%)</title><rect x="515.6" y="149" width="0.1" height="15.0" fill="rgb(208,149,39)" rx="2" ry="2" />
+<text  x="518.55" y="159.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (21 samples, 0.13%)</title><rect x="56.5" y="245" width="1.6" height="15.0" fill="rgb(226,128,25)" rx="2" ry="2" />
+<text  x="59.49" y="255.5" ></text>
+</g>
+<g >
+<title>native_write_msr (12 samples, 0.08%)</title><rect x="975.8" y="53" width="0.9" height="15.0" fill="rgb(248,88,25)" rx="2" ry="2" />
+<text  x="978.81" y="63.5" ></text>
+</g>
+<g >
+<title>tick_sched_handle (2 samples, 0.01%)</title><rect x="975.2" y="133" width="0.2" height="15.0" fill="rgb(228,217,9)" rx="2" ry="2" />
+<text  x="978.22" y="143.5" ></text>
+</g>
+<g >
+<title>std::use_facet&lt;std::ctype&lt;char&gt; &gt; (50 samples, 0.32%)</title><rect x="344.4" y="213" width="3.7" height="15.0" fill="rgb(223,209,37)" rx="2" ry="2" />
+<text  x="347.35" y="223.5" ></text>
+</g>
+<g >
+<title>malloc (296 samples, 1.87%)</title><rect x="1133.8" y="245" width="22.0" height="15.0" fill="rgb(217,90,20)" rx="2" ry="2" />
+<text  x="1136.75" y="255.5" >m..</text>
+</g>
+<g >
+<title>hsql::Expr::makeLiteral (3 samples, 0.02%)</title><rect x="278.4" y="213" width="0.2" height="15.0" fill="rgb(242,76,0)" rx="2" ry="2" />
+<text  x="281.42" y="223.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="1189.7" y="69" width="0.3" height="15.0" fill="rgb(229,88,15)" rx="2" ry="2" />
+<text  x="1192.70" y="79.5" ></text>
+</g>
+<g >
+<title>std::locale::operator= (48 samples, 0.30%)</title><rect x="1023.9" y="229" width="3.5" height="15.0" fill="rgb(252,94,32)" rx="2" ry="2" />
+<text  x="1026.87" y="239.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="56.2" y="181" width="0.3" height="15.0" fill="rgb(238,65,42)" rx="2" ry="2" />
+<text  x="59.19" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (38 samples, 0.24%)</title><rect x="1005.8" y="213" width="2.8" height="15.0" fill="rgb(227,123,0)" rx="2" ry="2" />
+<text  x="1008.76" y="223.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (5 samples, 0.03%)</title><rect x="975.0" y="165" width="0.4" height="15.0" fill="rgb(234,14,17)" rx="2" ry="2" />
+<text  x="977.99" y="175.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (12 samples, 0.08%)</title><rect x="975.8" y="69" width="0.9" height="15.0" fill="rgb(212,122,4)" rx="2" ry="2" />
+<text  x="978.81" y="79.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (310 samples, 1.96%)</title><rect x="478.4" y="181" width="23.1" height="15.0" fill="rgb(242,72,24)" rx="2" ry="2" />
+<text  x="481.38" y="191.5" >s..</text>
+</g>
+<g >
+<title>[unknown] (131 samples, 0.83%)</title><rect x="521.6" y="213" width="9.7" height="15.0" fill="rgb(215,55,27)" rx="2" ry="2" />
+<text  x="524.59" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParser::tokenize (97 samples, 0.61%)</title><rect x="191.2" y="197" width="7.2" height="15.0" fill="rgb(246,112,27)" rx="2" ry="2" />
+<text  x="194.18" y="207.5" ></text>
+</g>
+<g >
+<title>update_wall_time (2 samples, 0.01%)</title><rect x="975.1" y="101" width="0.1" height="15.0" fill="rgb(227,202,14)" rx="2" ry="2" />
+<text  x="978.07" y="111.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale (2 samples, 0.01%)</title><rect x="1007.2" y="197" width="0.1" height="15.0" fill="rgb(252,184,6)" rx="2" ry="2" />
+<text  x="1010.18" y="207.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParser::tokenize (25 samples, 0.16%)</title><rect x="508.1" y="229" width="1.9" height="15.0" fill="rgb(213,28,22)" rx="2" ry="2" />
+<text  x="511.10" y="239.5" ></text>
+</g>
+<g >
+<title>search_binary_handler (4 samples, 0.03%)</title><rect x="1189.7" y="165" width="0.3" height="15.0" fill="rgb(253,63,27)" rx="2" ry="2" />
+<text  x="1192.70" y="175.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParserResult::~SQLParserResult (56 samples, 0.35%)</title><rect x="510.0" y="229" width="4.1" height="15.0" fill="rgb(244,154,38)" rx="2" ry="2" />
+<text  x="512.97" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::overflow (20 samples, 0.13%)</title><rect x="1156.5" y="245" width="1.5" height="15.0" fill="rgb(220,114,50)" rx="2" ry="2" />
+<text  x="1159.55" y="255.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="1041.9" y="197" width="0.3" height="15.0" fill="rgb(240,40,38)" rx="2" ry="2" />
+<text  x="1044.89" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.04%)</title><rect x="1042.2" y="197" width="0.5" height="15.0" fill="rgb(210,82,11)" rx="2" ry="2" />
+<text  x="1045.19" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::SQLStatement*, std::allocator&lt;hsql::SQLStatement*&gt; &gt;::_M_realloc_insert&lt;hsql::SQLStatement* const&amp;&gt; (4 samples, 0.03%)</title><rect x="519.5" y="181" width="0.3" height="15.0" fill="rgb(222,7,48)" rx="2" ry="2" />
+<text  x="522.50" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (82 samples, 0.52%)</title><rect x="514.8" y="197" width="6.1" height="15.0" fill="rgb(241,77,26)" rx="2" ry="2" />
+<text  x="517.81" y="207.5" ></text>
+</g>
+<g >
+<title>std::has_facet&lt;std::ctype&lt;char&gt; &gt; (84 samples, 0.53%)</title><rect x="314.6" y="213" width="6.3" height="15.0" fill="rgb(233,43,29)" rx="2" ry="2" />
+<text  x="317.63" y="223.5" ></text>
+</g>
+<g >
+<title>hsql_lex (2 samples, 0.01%)</title><rect x="393.2" y="165" width="0.2" height="15.0" fill="rgb(227,48,34)" rx="2" ry="2" />
+<text  x="396.23" y="175.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::Expr*, std::allocator&lt;hsql::Expr*&gt; &gt;::_M_realloc_insert&lt;hsql::Expr* const&amp;&gt; (12 samples, 0.08%)</title><rect x="477.5" y="181" width="0.9" height="15.0" fill="rgb(252,174,11)" rx="2" ry="2" />
+<text  x="480.49" y="191.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::Expr (47 samples, 0.30%)</title><rect x="377.6" y="229" width="3.5" height="15.0" fill="rgb(238,41,50)" rx="2" ry="2" />
+<text  x="380.58" y="239.5" ></text>
+</g>
+<g >
+<title>hsql_lex_destroy (3 samples, 0.02%)</title><rect x="512.9" y="197" width="0.3" height="15.0" fill="rgb(220,164,25)" rx="2" ry="2" />
+<text  x="515.95" y="207.5" ></text>
+</g>
+<g >
+<title>std::use_facet&lt;std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; &gt; (57 samples, 0.36%)</title><rect x="351.1" y="213" width="4.2" height="15.0" fill="rgb(237,138,35)" rx="2" ry="2" />
+<text  x="354.06" y="223.5" ></text>
+</g>
+<g >
+<title>operator new (10 samples, 0.06%)</title><rect x="476.7" y="181" width="0.8" height="15.0" fill="rgb(243,100,4)" rx="2" ry="2" />
+<text  x="479.74" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,588 samples, 10.03%)</title><rect x="383.2" y="197" width="118.3" height="15.0" fill="rgb(206,173,4)" rx="2" ry="2" />
+<text  x="386.17" y="207.5" >[unknown]</text>
+</g>
+<g >
+<title>std::locale::locale (26 samples, 0.16%)</title><rect x="1021.9" y="229" width="2.0" height="15.0" fill="rgb(219,211,32)" rx="2" ry="2" />
+<text  x="1024.93" y="239.5" ></text>
+</g>
+<g >
+<title>std::ostream::sentry::~sentry (26 samples, 0.16%)</title><rect x="1047.2" y="197" width="1.9" height="15.0" fill="rgb(215,113,28)" rx="2" ry="2" />
+<text  x="1050.18" y="207.5" ></text>
+</g>
+<g >
+<title>cfree (14 samples, 0.09%)</title><rect x="182.8" y="181" width="1.0" height="15.0" fill="rgb(238,227,0)" rx="2" ry="2" />
+<text  x="185.76" y="191.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="1189.7" y="85" width="0.3" height="15.0" fill="rgb(213,192,41)" rx="2" ry="2" />
+<text  x="1192.70" y="95.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="56.2" y="133" width="0.3" height="15.0" fill="rgb(247,83,2)" rx="2" ry="2" />
+<text  x="59.19" y="143.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (1,084 samples, 6.84%)</title><rect x="60.8" y="229" width="80.8" height="15.0" fill="rgb(231,87,45)" rx="2" ry="2" />
+<text  x="63.81" y="239.5" >[libc-2.3..</text>
+</g>
+<g >
+<title>hsql::Alias::~Alias (2 samples, 0.01%)</title><rect x="180.9" y="117" width="0.2" height="15.0" fill="rgb(235,165,35)" rx="2" ry="2" />
+<text  x="183.90" y="127.5" ></text>
+</g>
+<g >
+<title>std::ios_base::~ios_base (16 samples, 0.10%)</title><rect x="1020.7" y="229" width="1.2" height="15.0" fill="rgb(215,138,13)" rx="2" ry="2" />
+<text  x="1023.74" y="239.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.01%)</title><rect x="476.0" y="165" width="0.1" height="15.0" fill="rgb(228,11,35)" rx="2" ry="2" />
+<text  x="479.00" y="175.5" ></text>
+</g>
+<g >
+<title>cfree (6 samples, 0.04%)</title><rect x="389.9" y="165" width="0.4" height="15.0" fill="rgb(221,124,35)" rx="2" ry="2" />
+<text  x="392.87" y="175.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (3 samples, 0.02%)</title><rect x="180.5" y="117" width="0.3" height="15.0" fill="rgb(253,219,51)" rx="2" ry="2" />
+<text  x="183.53" y="127.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (12 samples, 0.08%)</title><rect x="975.8" y="117" width="0.9" height="15.0" fill="rgb(206,62,10)" rx="2" ry="2" />
+<text  x="978.81" y="127.5" ></text>
+</g>
+<g >
+<title>[unknown] (13 samples, 0.08%)</title><rect x="180.5" y="149" width="1.0" height="15.0" fill="rgb(250,219,28)" rx="2" ry="2" />
+<text  x="183.53" y="159.5" ></text>
+</g>
+<g >
+<title>malloc (47 samples, 0.30%)</title><rect x="998.9" y="229" width="3.5" height="15.0" fill="rgb(251,119,27)" rx="2" ry="2" />
+<text  x="1001.91" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParserResult::setIsValid (5 samples, 0.03%)</title><rect x="512.1" y="197" width="0.3" height="15.0" fill="rgb(239,110,9)" rx="2" ry="2" />
+<text  x="515.05" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_parse (5 samples, 0.03%)</title><rect x="513.7" y="197" width="0.4" height="15.0" fill="rgb(218,80,25)" rx="2" ry="2" />
+<text  x="516.69" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_lex_init (7 samples, 0.04%)</title><rect x="513.2" y="197" width="0.5" height="15.0" fill="rgb(251,96,6)" rx="2" ry="2" />
+<text  x="516.17" y="207.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="141.3" y="101" width="0.3" height="15.0" fill="rgb(220,180,5)" rx="2" ry="2" />
+<text  x="144.27" y="111.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="1189.7" y="37" width="0.3" height="15.0" fill="rgb(208,64,8)" rx="2" ry="2" />
+<text  x="1192.70" y="47.5" ></text>
+</g>
+<g >
+<title>cfree (53 samples, 0.33%)</title><rect x="185.5" y="197" width="4.0" height="15.0" fill="rgb(208,25,19)" rx="2" ry="2" />
+<text  x="188.52" y="207.5" ></text>
+</g>
+<g >
+<title>std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt; (18 samples, 0.11%)</title><rect x="1008.6" y="229" width="1.3" height="15.0" fill="rgb(250,206,12)" rx="2" ry="2" />
+<text  x="1011.59" y="239.5" ></text>
+</g>
+<g >
+<title>hsql_parse (275 samples, 1.74%)</title><rect x="289.3" y="213" width="20.5" height="15.0" fill="rgb(246,57,42)" rx="2" ry="2" />
+<text  x="292.30" y="223.5" ></text>
+</g>
+<g >
+<title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::operator= (11 samples, 0.07%)</title><rect x="1010.9" y="229" width="0.8" height="15.0" fill="rgb(224,200,51)" rx="2" ry="2" />
+<text  x="1013.90" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParser::tokenize (4 samples, 0.03%)</title><rect x="184.6" y="181" width="0.3" height="15.0" fill="rgb(206,66,41)" rx="2" ry="2" />
+<text  x="187.63" y="191.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__vmi_class_type_info::__do_dyncast (147 samples, 0.93%)</title><rect x="1076.6" y="245" width="11.0" height="15.0" fill="rgb(222,32,40)" rx="2" ry="2" />
+<text  x="1079.61" y="255.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (12 samples, 0.08%)</title><rect x="975.8" y="133" width="0.9" height="15.0" fill="rgb(247,104,45)" rx="2" ry="2" />
+<text  x="978.81" y="143.5" ></text>
+</g>
+<g >
+<title>[unknown] (534 samples, 3.37%)</title><rect x="172.5" y="213" width="39.8" height="15.0" fill="rgb(238,211,38)" rx="2" ry="2" />
+<text  x="175.48" y="223.5" >[un..</text>
+</g>
+<g >
+<title>hsql::Expr::makeOpBinary (34 samples, 0.21%)</title><rect x="406.9" y="181" width="2.6" height="15.0" fill="rgb(234,49,51)" rx="2" ry="2" />
+<text  x="409.93" y="191.5" ></text>
+</g>
+<g >
+<title>__x64_sys_execve (4 samples, 0.03%)</title><rect x="1189.7" y="197" width="0.3" height="15.0" fill="rgb(215,123,42)" rx="2" ry="2" />
+<text  x="1192.70" y="207.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="368.1" y="85" width="0.3" height="15.0" fill="rgb(243,155,11)" rx="2" ry="2" />
+<text  x="371.12" y="95.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (80 samples, 0.51%)</title><rect x="153.6" y="213" width="6.0" height="15.0" fill="rgb(234,65,33)" rx="2" ry="2" />
+<text  x="156.64" y="223.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (12 samples, 0.08%)</title><rect x="975.8" y="149" width="0.9" height="15.0" fill="rgb(235,159,20)" rx="2" ry="2" />
+<text  x="978.81" y="159.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="368.1" y="133" width="0.3" height="15.0" fill="rgb(235,81,39)" rx="2" ry="2" />
+<text  x="371.12" y="143.5" ></text>
+</g>
+<g >
+<title>load_elf_binary (4 samples, 0.03%)</title><rect x="1189.7" y="149" width="0.3" height="15.0" fill="rgb(205,172,36)" rx="2" ry="2" />
+<text  x="1192.70" y="159.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (67 samples, 0.42%)</title><rect x="141.6" y="229" width="5.0" height="15.0" fill="rgb(211,101,11)" rx="2" ry="2" />
+<text  x="144.57" y="239.5" ></text>
+</g>
+<g >
+<title>operator delete (4 samples, 0.03%)</title><rect x="210.3" y="197" width="0.3" height="15.0" fill="rgb(228,223,41)" rx="2" ry="2" />
+<text  x="213.33" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (78 samples, 0.49%)</title><rect x="179.6" y="197" width="5.8" height="15.0" fill="rgb(250,87,42)" rx="2" ry="2" />
+<text  x="182.64" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_pbump (5 samples, 0.03%)</title><rect x="1156.2" y="245" width="0.3" height="15.0" fill="rgb(211,18,49)" rx="2" ry="2" />
+<text  x="1159.18" y="255.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::Expr*, std::allocator&lt;hsql::Expr*&gt; &gt;::_M_realloc_insert&lt;hsql::Expr* const&amp;&gt; (7 samples, 0.04%)</title><rect x="1031.0" y="229" width="0.5" height="15.0" fill="rgb(235,136,51)" rx="2" ry="2" />
+<text  x="1034.02" y="239.5" ></text>
+</g>
+<g >
+<title>tick_sched_timer (4 samples, 0.03%)</title><rect x="975.1" y="149" width="0.3" height="15.0" fill="rgb(220,102,33)" rx="2" ry="2" />
+<text  x="978.07" y="159.5" ></text>
+</g>
+<g >
+<title>hsql::TableRef::~TableRef (4 samples, 0.03%)</title><rect x="1122.9" y="245" width="0.3" height="15.0" fill="rgb(243,77,21)" rx="2" ry="2" />
+<text  x="1125.88" y="255.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParserResult::~SQLParserResult (5 samples, 0.03%)</title><rect x="512.4" y="197" width="0.4" height="15.0" fill="rgb(248,37,47)" rx="2" ry="2" />
+<text  x="515.43" y="207.5" ></text>
+</g>
+<g >
+<title>ctx_resched (4 samples, 0.03%)</title><rect x="1189.7" y="101" width="0.3" height="15.0" fill="rgb(250,130,43)" rx="2" ry="2" />
+<text  x="1192.70" y="111.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="56.2" y="85" width="0.3" height="15.0" fill="rgb(244,212,33)" rx="2" ry="2" />
+<text  x="59.19" y="95.5" ></text>
+</g>
+<g >
+<title>cfree (49 samples, 0.31%)</title><rect x="373.9" y="229" width="3.7" height="15.0" fill="rgb(244,75,5)" rx="2" ry="2" />
+<text  x="376.93" y="239.5" ></text>
+</g>
+<g >
+<title>std::ios_base::ios_base (31 samples, 0.20%)</title><rect x="1018.4" y="229" width="2.3" height="15.0" fill="rgb(237,53,4)" rx="2" ry="2" />
+<text  x="1021.43" y="239.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_dispose_callbacks (5 samples, 0.03%)</title><rect x="1012.3" y="229" width="0.4" height="15.0" fill="rgb(233,175,21)" rx="2" ry="2" />
+<text  x="1015.32" y="239.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (12 samples, 0.08%)</title><rect x="975.8" y="85" width="0.9" height="15.0" fill="rgb(240,112,4)" rx="2" ry="2" />
+<text  x="978.81" y="95.5" ></text>
+</g>
+<g >
+<title>BM_TokenizeBenchmark (32 samples, 0.20%)</title><rect x="58.4" y="229" width="2.3" height="15.0" fill="rgb(227,225,43)" rx="2" ry="2" />
+<text  x="61.35" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (23 samples, 0.15%)</title><rect x="189.5" y="197" width="1.7" height="15.0" fill="rgb(247,173,34)" rx="2" ry="2" />
+<text  x="192.47" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_parse (28 samples, 0.18%)</title><rect x="208.2" y="197" width="2.1" height="15.0" fill="rgb(252,220,46)" rx="2" ry="2" />
+<text  x="211.24" y="207.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="368.1" y="149" width="0.3" height="15.0" fill="rgb(249,151,18)" rx="2" ry="2" />
+<text  x="371.12" y="159.5" ></text>
+</g>
+<g >
+<title>perf_event_exec (4 samples, 0.03%)</title><rect x="1189.7" y="117" width="0.3" height="15.0" fill="rgb(247,89,45)" rx="2" ry="2" />
+<text  x="1192.70" y="127.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeFunctionRef (6 samples, 0.04%)</title><rect x="392.8" y="165" width="0.4" height="15.0" fill="rgb(215,65,44)" rx="2" ry="2" />
+<text  x="395.78" y="175.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="141.3" y="197" width="0.3" height="15.0" fill="rgb(232,217,14)" rx="2" ry="2" />
+<text  x="144.27" y="207.5" ></text>
+</g>
+<g >
+<title>BM_ParseBenchmark (6 samples, 0.04%)</title><rect x="510.0" y="197" width="0.4" height="15.0" fill="rgb(244,215,41)" rx="2" ry="2" />
+<text  x="512.97" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_lex_init (21 samples, 0.13%)</title><rect x="287.7" y="213" width="1.6" height="15.0" fill="rgb(234,32,49)" rx="2" ry="2" />
+<text  x="290.73" y="223.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (2 samples, 0.01%)</title><rect x="514.8" y="181" width="0.2" height="15.0" fill="rgb(249,135,53)" rx="2" ry="2" />
+<text  x="517.81" y="191.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (4 samples, 0.03%)</title><rect x="56.2" y="117" width="0.3" height="15.0" fill="rgb(216,140,17)" rx="2" ry="2" />
+<text  x="59.19" y="127.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (3 samples, 0.02%)</title><rect x="510.6" y="197" width="0.3" height="15.0" fill="rgb(211,65,29)" rx="2" ry="2" />
+<text  x="513.64" y="207.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (4 samples, 0.03%)</title><rect x="368.1" y="213" width="0.3" height="15.0" fill="rgb(211,57,8)" rx="2" ry="2" />
+<text  x="371.12" y="223.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_swap (6 samples, 0.04%)</title><rect x="331.1" y="213" width="0.4" height="15.0" fill="rgb(225,61,2)" rx="2" ry="2" />
+<text  x="334.09" y="223.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_call_callbacks (8 samples, 0.05%)</title><rect x="1011.7" y="229" width="0.6" height="15.0" fill="rgb(230,154,20)" rx="2" ry="2" />
+<text  x="1014.72" y="239.5" ></text>
+</g>
+<g >
+<title>std::locale::~locale (44 samples, 0.28%)</title><rect x="1027.4" y="229" width="3.3" height="15.0" fill="rgb(223,178,27)" rx="2" ry="2" />
+<text  x="1030.44" y="239.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="141.3" y="133" width="0.3" height="15.0" fill="rgb(221,71,14)" rx="2" ry="2" />
+<text  x="144.27" y="143.5" ></text>
+</g>
+<g >
+<title>std::locale::operator= (23 samples, 0.15%)</title><rect x="340.8" y="213" width="1.7" height="15.0" fill="rgb(224,12,50)" rx="2" ry="2" />
+<text  x="343.78" y="223.5" ></text>
+</g>
+<g >
+<title>hsql__switch_to_buffer (11 samples, 0.07%)</title><rect x="535.1" y="229" width="0.8" height="15.0" fill="rgb(226,203,20)" rx="2" ry="2" />
+<text  x="538.07" y="239.5" ></text>
+</g>
+<g >
+<title>std::locale::locale (26 samples, 0.16%)</title><rect x="338.8" y="213" width="2.0" height="15.0" fill="rgb(217,51,42)" rx="2" ry="2" />
+<text  x="341.84" y="223.5" ></text>
+</g>
+<g >
+<title>std::locale::locale (8 samples, 0.05%)</title><rect x="210.9" y="197" width="0.5" height="15.0" fill="rgb(205,49,9)" rx="2" ry="2" />
+<text  x="213.85" y="207.5" ></text>
+</g>
+<g >
+<title>hsql::SelectStatement::~SelectStatement (92 samples, 0.58%)</title><rect x="514.2" y="229" width="6.9" height="15.0" fill="rgb(220,61,10)" rx="2" ry="2" />
+<text  x="517.21" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::SelectStatement::~SelectStatement (2 samples, 0.01%)</title><rect x="520.9" y="197" width="0.2" height="15.0" fill="rgb(227,39,22)" rx="2" ry="2" />
+<text  x="523.92" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_sync (14 samples, 0.09%)</title><rect x="1006.1" y="197" width="1.1" height="15.0" fill="rgb(242,130,6)" rx="2" ry="2" />
+<text  x="1009.13" y="207.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (2 samples, 0.01%)</title><rect x="476.0" y="117" width="0.1" height="15.0" fill="rgb(205,30,37)" rx="2" ry="2" />
+<text  x="479.00" y="127.5" ></text>
+</g>
+<g >
+<title>hsql_lex (4 samples, 0.03%)</title><rect x="181.2" y="133" width="0.3" height="15.0" fill="rgb(209,121,33)" rx="2" ry="2" />
+<text  x="184.20" y="143.5" ></text>
+</g>
+<g >
+<title>hsql::TableRef::~TableRef (10 samples, 0.06%)</title><rect x="530.5" y="197" width="0.8" height="15.0" fill="rgb(236,210,6)" rx="2" ry="2" />
+<text  x="533.53" y="207.5" ></text>
+</g>
+<g >
+<title>__pthread_once (25 samples, 0.16%)</title><rect x="368.4" y="229" width="1.9" height="15.0" fill="rgb(245,91,52)" rx="2" ry="2" />
+<text  x="371.42" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::Expr (109 samples, 0.69%)</title><rect x="268.8" y="213" width="8.1" height="15.0" fill="rgb(239,136,51)" rx="2" ry="2" />
+<text  x="271.81" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::TableAccess::TableAccess (7 samples, 0.04%)</title><rect x="521.1" y="229" width="0.5" height="15.0" fill="rgb(205,221,49)" rx="2" ry="2" />
+<text  x="524.07" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeCaseList (5 samples, 0.03%)</title><rect x="406.4" y="181" width="0.4" height="15.0" fill="rgb(215,159,10)" rx="2" ry="2" />
+<text  x="409.41" y="191.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="141.3" y="117" width="0.3" height="15.0" fill="rgb(253,101,4)" rx="2" ry="2" />
+<text  x="144.27" y="127.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::TableRef*, std::allocator&lt;hsql::TableRef*&gt; &gt;::_M_realloc_insert&lt;hsql::TableRef* const&amp;&gt; (2 samples, 0.01%)</title><rect x="523.5" y="165" width="0.1" height="15.0" fill="rgb(210,10,35)" rx="2" ry="2" />
+<text  x="526.45" y="175.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeLiteral (8 samples, 0.05%)</title><rect x="381.2" y="229" width="0.6" height="15.0" fill="rgb(232,214,1)" rx="2" ry="2" />
+<text  x="384.23" y="239.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (2 samples, 0.01%)</title><rect x="386.4" y="165" width="0.2" height="15.0" fill="rgb(208,217,45)" rx="2" ry="2" />
+<text  x="389.45" y="175.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 0.03%)</title><rect x="1189.7" y="213" width="0.3" height="15.0" fill="rgb(239,35,0)" rx="2" ry="2" />
+<text  x="1192.70" y="223.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (3 samples, 0.02%)</title><rect x="386.6" y="149" width="0.2" height="15.0" fill="rgb(210,84,18)" rx="2" ry="2" />
+<text  x="389.60" y="159.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (15 samples, 0.09%)</title><rect x="975.6" y="213" width="1.1" height="15.0" fill="rgb(216,194,47)" rx="2" ry="2" />
+<text  x="978.59" y="223.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_init (3 samples, 0.02%)</title><rect x="210.6" y="197" width="0.3" height="15.0" fill="rgb(225,45,46)" rx="2" ry="2" />
+<text  x="213.63" y="207.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (2 samples, 0.01%)</title><rect x="476.0" y="149" width="0.1" height="15.0" fill="rgb(249,79,10)" rx="2" ry="2" />
+<text  x="479.00" y="159.5" ></text>
+</g>
+<g >
+<title>cfree (50 samples, 0.32%)</title><rect x="265.0" y="213" width="3.7" height="15.0" fill="rgb(206,18,30)" rx="2" ry="2" />
+<text  x="268.01" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (97 samples, 0.61%)</title><rect x="1041.9" y="213" width="7.2" height="15.0" fill="rgb(253,190,22)" rx="2" ry="2" />
+<text  x="1044.89" y="223.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (26 samples, 0.16%)</title><rect x="177.3" y="197" width="2.0" height="15.0" fill="rgb(212,224,1)" rx="2" ry="2" />
+<text  x="180.33" y="207.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_swap (76 samples, 0.48%)</title><rect x="1012.8" y="229" width="5.6" height="15.0" fill="rgb(236,174,44)" rx="2" ry="2" />
+<text  x="1015.77" y="239.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (95 samples, 0.60%)</title><rect x="146.6" y="229" width="7.0" height="15.0" fill="rgb(207,86,47)" rx="2" ry="2" />
+<text  x="149.56" y="239.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="141.3" y="149" width="0.3" height="15.0" fill="rgb(229,124,53)" rx="2" ry="2" />
+<text  x="144.27" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (33 samples, 0.21%)</title><rect x="180.3" y="181" width="2.5" height="15.0" fill="rgb(210,177,15)" rx="2" ry="2" />
+<text  x="183.31" y="191.5" ></text>
+</g>
+<g >
+<title>hsql::SelectStatement::~SelectStatement (3 samples, 0.02%)</title><rect x="530.3" y="197" width="0.2" height="15.0" fill="rgb(233,13,49)" rx="2" ry="2" />
+<text  x="533.31" y="207.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale (7 samples, 0.04%)</title><rect x="1009.9" y="229" width="0.6" height="15.0" fill="rgb(227,37,46)" rx="2" ry="2" />
+<text  x="1012.93" y="239.5" ></text>
+</g>
+<g >
+<title>malloc (8 samples, 0.05%)</title><rect x="476.1" y="181" width="0.6" height="15.0" fill="rgb(247,43,14)" rx="2" ry="2" />
+<text  x="479.14" y="191.5" ></text>
+</g>
+<g >
+<title>yydestruct (3 samples, 0.02%)</title><rect x="1049.1" y="229" width="0.2" height="15.0" fill="rgb(224,61,17)" rx="2" ry="2" />
+<text  x="1052.12" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (84 samples, 0.53%)</title><rect x="514.8" y="213" width="6.3" height="15.0" fill="rgb(213,54,26)" rx="2" ry="2" />
+<text  x="517.81" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::Expr (163 samples, 1.03%)</title><rect x="394.3" y="181" width="12.1" height="15.0" fill="rgb(231,110,9)" rx="2" ry="2" />
+<text  x="397.27" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (21 samples, 0.13%)</title><rect x="180.5" y="165" width="1.5" height="15.0" fill="rgb(210,137,2)" rx="2" ry="2" />
+<text  x="183.46" y="175.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeColumnRef (15 samples, 0.09%)</title><rect x="276.9" y="213" width="1.1" height="15.0" fill="rgb(240,225,16)" rx="2" ry="2" />
+<text  x="279.93" y="223.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::init (22 samples, 0.14%)</title><rect x="1158.8" y="245" width="1.6" height="15.0" fill="rgb(243,47,44)" rx="2" ry="2" />
+<text  x="1161.78" y="255.5" ></text>
+</g>
+<g >
+<title>hsql_parse (6 samples, 0.04%)</title><rect x="522.6" y="149" width="0.5" height="15.0" fill="rgb(229,203,52)" rx="2" ry="2" />
+<text  x="525.63" y="159.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::Expr*, std::allocator&lt;hsql::Expr*&gt; &gt;::_M_realloc_insert&lt;hsql::Expr* const&amp;&gt; (2 samples, 0.01%)</title><rect x="185.3" y="181" width="0.1" height="15.0" fill="rgb(241,146,0)" rx="2" ry="2" />
+<text  x="188.30" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::Expr*, std::allocator&lt;hsql::Expr*&gt; &gt;::_M_realloc_insert&lt;hsql::Expr* const&amp;&gt; (9 samples, 0.06%)</title><rect x="393.6" y="165" width="0.7" height="15.0" fill="rgb(245,15,47)" rx="2" ry="2" />
+<text  x="396.60" y="175.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="141.3" y="181" width="0.3" height="15.0" fill="rgb(232,214,39)" rx="2" ry="2" />
+<text  x="144.27" y="191.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (30 samples, 0.19%)</title><rect x="278.6" y="213" width="2.3" height="15.0" fill="rgb(222,117,51)" rx="2" ry="2" />
+<text  x="281.65" y="223.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale (46 samples, 0.29%)</title><rect x="311.2" y="213" width="3.4" height="15.0" fill="rgb(221,161,15)" rx="2" ry="2" />
+<text  x="314.20" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (56 samples, 0.35%)</title><rect x="510.0" y="213" width="4.1" height="15.0" fill="rgb(211,86,11)" rx="2" ry="2" />
+<text  x="512.97" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeCaseListElement (2 samples, 0.01%)</title><rect x="406.8" y="181" width="0.1" height="15.0" fill="rgb(225,21,36)" rx="2" ry="2" />
+<text  x="409.79" y="191.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (6 samples, 0.04%)</title><rect x="975.0" y="213" width="0.4" height="15.0" fill="rgb(223,132,40)" rx="2" ry="2" />
+<text  x="977.99" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::TableRef::~TableRef (131 samples, 0.83%)</title><rect x="521.6" y="229" width="9.7" height="15.0" fill="rgb(207,168,30)" rx="2" ry="2" />
+<text  x="524.59" y="239.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__si_class_type_info::__do_dyncast (366 samples, 2.31%)</title><rect x="1049.3" y="245" width="27.3" height="15.0" fill="rgb(235,96,33)" rx="2" ry="2" />
+<text  x="1052.34" y="255.5" >_..</text>
+</g>
+<g >
+<title>hsql_alloc (5 samples, 0.03%)</title><rect x="535.9" y="229" width="0.4" height="15.0" fill="rgb(233,3,6)" rx="2" ry="2" />
+<text  x="538.89" y="239.5" ></text>
+</g>
+<g >
+<title>std::locale::id::_M_id (98 samples, 0.62%)</title><rect x="331.5" y="213" width="7.3" height="15.0" fill="rgb(226,115,21)" rx="2" ry="2" />
+<text  x="334.54" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (29 samples, 0.18%)</title><rect x="409.5" y="181" width="2.1" height="15.0" fill="rgb(227,159,25)" rx="2" ry="2" />
+<text  x="412.47" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (122 samples, 0.77%)</title><rect x="1031.8" y="229" width="9.1" height="15.0" fill="rgb(232,106,25)" rx="2" ry="2" />
+<text  x="1034.76" y="239.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (3 samples, 0.02%)</title><rect x="522.0" y="197" width="0.2" height="15.0" fill="rgb(249,152,45)" rx="2" ry="2" />
+<text  x="524.96" y="207.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (7 samples, 0.04%)</title><rect x="182.0" y="165" width="0.5" height="15.0" fill="rgb(235,195,47)" rx="2" ry="2" />
+<text  x="185.02" y="175.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::makeCase (2 samples, 0.01%)</title><rect x="502.5" y="197" width="0.2" height="15.0" fill="rgb(246,18,14)" rx="2" ry="2" />
+<text  x="505.52" y="207.5" ></text>
+</g>
+<g >
+<title>hsql_lex (72 samples, 0.45%)</title><rect x="282.4" y="213" width="5.3" height="15.0" fill="rgb(235,210,3)" rx="2" ry="2" />
+<text  x="285.37" y="223.5" ></text>
+</g>
+<g >
+<title>cfree (2 samples, 0.01%)</title><rect x="523.1" y="165" width="0.1" height="15.0" fill="rgb(233,140,43)" rx="2" ry="2" />
+<text  x="526.08" y="175.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.01%)</title><rect x="519.4" y="181" width="0.1" height="15.0" fill="rgb(205,188,44)" rx="2" ry="2" />
+<text  x="522.35" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (13,302 samples, 83.98%)</title><rect x="58.4" y="245" width="990.9" height="15.0" fill="rgb(211,170,14)" rx="2" ry="2" />
+<text  x="61.35" y="255.5" >[unknown]</text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (1,695 samples, 10.70%)</title><rect x="381.8" y="229" width="126.3" height="15.0" fill="rgb(229,155,50)" rx="2" ry="2" />
+<text  x="384.83" y="239.5" >hsql::Expr::~Expr</text>
+</g>
+<g >
+<title>all (15,839 samples, 100%)</title><rect x="10.0" y="277" width="1180.0" height="15.0" fill="rgb(243,112,46)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="368.1" y="53" width="0.3" height="15.0" fill="rgb(209,96,11)" rx="2" ry="2" />
+<text  x="371.12" y="63.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (4 samples, 0.03%)</title><rect x="56.2" y="165" width="0.3" height="15.0" fill="rgb(230,51,27)" rx="2" ry="2" />
+<text  x="59.19" y="175.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (5 samples, 0.03%)</title><rect x="56.1" y="229" width="0.4" height="15.0" fill="rgb(225,178,16)" rx="2" ry="2" />
+<text  x="59.12" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (372 samples, 2.35%)</title><rect x="1162.0" y="245" width="27.7" height="15.0" fill="rgb(245,43,24)" rx="2" ry="2" />
+<text  x="1164.99" y="255.5" >s..</text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::overflow (8 samples, 0.05%)</title><rect x="1042.7" y="197" width="0.6" height="15.0" fill="rgb(221,70,17)" rx="2" ry="2" />
+<text  x="1045.71" y="207.5" ></text>
+</g>
+<g >
+<title>[benchmark] (3 samples, 0.02%)</title><rect x="510.4" y="197" width="0.2" height="15.0" fill="rgb(213,207,42)" rx="2" ry="2" />
+<text  x="513.41" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (4 samples, 0.03%)</title><rect x="1189.7" y="245" width="0.3" height="15.0" fill="rgb(253,41,52)" rx="2" ry="2" />
+<text  x="1192.70" y="255.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (2 samples, 0.01%)</title><rect x="501.3" y="165" width="0.2" height="15.0" fill="rgb(207,48,8)" rx="2" ry="2" />
+<text  x="504.33" y="175.5" ></text>
+</g>
+<g >
+<title>hsql_free (5 samples, 0.03%)</title><rect x="536.3" y="229" width="0.3" height="15.0" fill="rgb(240,208,34)" rx="2" ry="2" />
+<text  x="539.27" y="239.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (4 samples, 0.03%)</title><rect x="56.2" y="149" width="0.3" height="15.0" fill="rgb(218,203,40)" rx="2" ry="2" />
+<text  x="59.19" y="159.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (4 samples, 0.03%)</title><rect x="522.3" y="181" width="0.3" height="15.0" fill="rgb(205,16,38)" rx="2" ry="2" />
+<text  x="525.26" y="191.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (2 samples, 0.01%)</title><rect x="476.0" y="133" width="0.1" height="15.0" fill="rgb(207,12,42)" rx="2" ry="2" />
+<text  x="479.00" y="143.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (5 samples, 0.03%)</title><rect x="389.5" y="149" width="0.4" height="15.0" fill="rgb(230,19,40)" rx="2" ry="2" />
+<text  x="392.50" y="159.5" ></text>
+</g>
+<g >
+<title>hsql_parse (285 samples, 1.80%)</title><rect x="977.7" y="229" width="21.2" height="15.0" fill="rgb(233,163,27)" rx="2" ry="2" />
+<text  x="980.68" y="239.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::init (6 samples, 0.04%)</title><rect x="1010.5" y="229" width="0.4" height="15.0" fill="rgb(249,152,43)" rx="2" ry="2" />
+<text  x="1013.46" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;hsql::TableRef*, std::allocator&lt;hsql::TableRef*&gt; &gt;::_M_realloc_insert&lt;hsql::TableRef* const&amp;&gt; (3 samples, 0.02%)</title><rect x="528.0" y="181" width="0.2" height="15.0" fill="rgb(219,32,10)" rx="2" ry="2" />
+<text  x="531.00" y="191.5" ></text>
+</g>
+<g >
+<title>std::locale::~locale (12 samples, 0.08%)</title><rect x="342.5" y="213" width="0.9" height="15.0" fill="rgb(217,170,32)" rx="2" ry="2" />
+<text  x="345.49" y="223.5" ></text>
+</g>
+<g >
+<title>[unknown] (8 samples, 0.05%)</title><rect x="180.5" y="133" width="0.6" height="15.0" fill="rgb(214,197,47)" rx="2" ry="2" />
+<text  x="183.53" y="143.5" ></text>
+</g>
+<g >
+<title>hsql_lex (2 samples, 0.01%)</title><rect x="182.6" y="165" width="0.2" height="15.0" fill="rgb(209,97,9)" rx="2" ry="2" />
+<text  x="185.62" y="175.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (37 samples, 0.23%)</title><rect x="383.2" y="181" width="2.7" height="15.0" fill="rgb(226,172,11)" rx="2" ry="2" />
+<text  x="386.17" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (6 samples, 0.04%)</title><rect x="522.6" y="165" width="0.5" height="15.0" fill="rgb(234,29,28)" rx="2" ry="2" />
+<text  x="525.63" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,678 samples, 10.59%)</title><rect x="383.1" y="213" width="125.0" height="15.0" fill="rgb(249,181,49)" rx="2" ry="2" />
+<text  x="386.09" y="223.5" >[unknown]</text>
+</g>
+<g >
+<title>hsql::Expr::makeFunctionRef (5 samples, 0.03%)</title><rect x="278.0" y="213" width="0.4" height="15.0" fill="rgb(229,192,7)" rx="2" ry="2" />
+<text  x="281.05" y="223.5" ></text>
+</g>
+<g >
+<title>hsql_parse (57 samples, 0.36%)</title><rect x="523.6" y="181" width="4.2" height="15.0" fill="rgb(208,118,18)" rx="2" ry="2" />
+<text  x="526.60" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (100 samples, 0.63%)</title><rect x="522.3" y="197" width="7.4" height="15.0" fill="rgb(232,189,24)" rx="2" ry="2" />
+<text  x="525.26" y="207.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (348 samples, 2.20%)</title><rect x="1087.6" y="245" width="25.9" height="15.0" fill="rgb(240,166,34)" rx="2" ry="2" />
+<text  x="1090.56" y="255.5" >_..</text>
+</g>
+<g >
+<title>__dynamic_cast (708 samples, 4.47%)</title><rect x="212.3" y="213" width="52.7" height="15.0" fill="rgb(236,50,22)" rx="2" ry="2" />
+<text  x="215.27" y="223.5" >__dyn..</text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (2 samples, 0.01%)</title><rect x="501.3" y="149" width="0.2" height="15.0" fill="rgb(224,88,50)" rx="2" ry="2" />
+<text  x="504.33" y="159.5" ></text>
+</g>
+<g >
+<title>hsql_lex (2 samples, 0.01%)</title><rect x="181.9" y="149" width="0.1" height="15.0" fill="rgb(233,172,42)" rx="2" ry="2" />
+<text  x="184.87" y="159.5" ></text>
+</g>
+<g >
+<title>operator new (7 samples, 0.04%)</title><rect x="1002.6" y="229" width="0.6" height="15.0" fill="rgb(237,54,18)" rx="2" ry="2" />
+<text  x="1005.63" y="239.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="1189.7" y="53" width="0.3" height="15.0" fill="rgb(207,185,18)" rx="2" ry="2" />
+<text  x="1192.70" y="63.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::Expr (33 samples, 0.21%)</title><rect x="390.3" y="165" width="2.5" height="15.0" fill="rgb(239,194,16)" rx="2" ry="2" />
+<text  x="393.32" y="175.5" ></text>
+</g>
+<g >
+<title>[libsqlparser.so] (21 samples, 0.13%)</title><rect x="159.6" y="213" width="1.6" height="15.0" fill="rgb(232,170,16)" rx="2" ry="2" />
+<text  x="162.60" y="223.5" ></text>
+</g>
+<g >
+<title>std::basic_streambuf&lt;char, std::char_traits&lt;char&gt; &gt;::xsputn (24 samples, 0.15%)</title><rect x="1045.4" y="197" width="1.8" height="15.0" fill="rgb(216,194,31)" rx="2" ry="2" />
+<text  x="1048.40" y="207.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (8 samples, 0.05%)</title><rect x="179.6" y="181" width="0.6" height="15.0" fill="rgb(237,20,49)" rx="2" ry="2" />
+<text  x="182.64" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_stringbuf (38 samples, 0.24%)</title><rect x="1005.8" y="229" width="2.8" height="15.0" fill="rgb(226,171,10)" rx="2" ry="2" />
+<text  x="1008.76" y="239.5" ></text>
+</g>
+<g >
+<title>__cxxabiv1::__vmi_class_type_info::__do_dyncast (146 samples, 0.92%)</title><rect x="357.5" y="229" width="10.9" height="15.0" fill="rgb(242,96,16)" rx="2" ry="2" />
+<text  x="360.54" y="239.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace (23 samples, 0.15%)</title><rect x="1003.2" y="229" width="1.7" height="15.0" fill="rgb(235,91,0)" rx="2" ry="2" />
+<text  x="1006.15" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.06%)</title><rect x="515.0" y="165" width="0.7" height="15.0" fill="rgb(245,85,30)" rx="2" ry="2" />
+<text  x="517.96" y="175.5" ></text>
+</g>
+<g >
+<title>schedule (12 samples, 0.08%)</title><rect x="975.8" y="165" width="0.9" height="15.0" fill="rgb(234,142,38)" rx="2" ry="2" />
+<text  x="978.81" y="175.5" ></text>
+</g>
+<g >
+<title>std::has_facet&lt;std::num_put&lt;char, std::ostreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; &gt; (54 samples, 0.34%)</title><rect x="325.2" y="213" width="4.0" height="15.0" fill="rgb(225,124,41)" rx="2" ry="2" />
+<text  x="328.21" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (3 samples, 0.02%)</title><rect x="181.6" y="149" width="0.2" height="15.0" fill="rgb(214,103,32)" rx="2" ry="2" />
+<text  x="184.57" y="159.5" ></text>
+</g>
+<g >
+<title>schedule (4 samples, 0.03%)</title><rect x="368.1" y="165" width="0.3" height="15.0" fill="rgb(231,39,26)" rx="2" ry="2" />
+<text  x="371.12" y="175.5" ></text>
+</g>
+<g >
+<title>cfree (8 samples, 0.05%)</title><rect x="529.7" y="197" width="0.6" height="15.0" fill="rgb(241,41,28)" rx="2" ry="2" />
+<text  x="532.71" y="207.5" ></text>
+</g>
+<g >
+<title>benchmark (15,835 samples, 99.97%)</title><rect x="10.0" y="261" width="1179.7" height="15.0" fill="rgb(209,217,38)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" >benchmark</text>
+</g>
+<g >
+<title>__do_execve_file.isra.0 (4 samples, 0.03%)</title><rect x="1189.7" y="181" width="0.3" height="15.0" fill="rgb(250,201,8)" rx="2" ry="2" />
+<text  x="1192.70" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (14 samples, 0.09%)</title><rect x="522.6" y="181" width="1.0" height="15.0" fill="rgb(237,170,5)" rx="2" ry="2" />
+<text  x="525.56" y="191.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::Expr (14 samples, 0.09%)</title><rect x="501.5" y="197" width="1.0" height="15.0" fill="rgb(210,147,7)" rx="2" ry="2" />
+<text  x="504.47" y="207.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="368.1" y="69" width="0.3" height="15.0" fill="rgb(207,192,24)" rx="2" ry="2" />
+<text  x="371.12" y="79.5" ></text>
+</g>
+<g >
+<title>operator new (8 samples, 0.05%)</title><rect x="310.6" y="213" width="0.6" height="15.0" fill="rgb(228,41,50)" rx="2" ry="2" />
+<text  x="313.61" y="223.5" ></text>
+</g>
+<g >
+<title>hsql_parse (142 samples, 0.90%)</title><rect x="1123.2" y="245" width="10.6" height="15.0" fill="rgb(223,193,39)" rx="2" ry="2" />
+<text  x="1126.17" y="255.5" ></text>
+</g>
+<g >
+<title>virtual thunk to std::__cxx11::basic_stringstream&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::~basic_stringstream (97 samples, 0.61%)</title><rect x="1041.9" y="229" width="7.2" height="15.0" fill="rgb(230,228,54)" rx="2" ry="2" />
+<text  x="1044.89" y="239.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (5 samples, 0.03%)</title><rect x="56.1" y="213" width="0.4" height="15.0" fill="rgb(239,17,2)" rx="2" ry="2" />
+<text  x="59.12" y="223.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (15 samples, 0.09%)</title><rect x="975.6" y="197" width="1.1" height="15.0" fill="rgb(241,181,22)" rx="2" ry="2" />
+<text  x="978.59" y="207.5" ></text>
+</g>
+<g >
+<title>swapgs_restore_regs_and_return_to_usermode (4 samples, 0.03%)</title><rect x="141.3" y="213" width="0.3" height="15.0" fill="rgb(228,76,44)" rx="2" ry="2" />
+<text  x="144.27" y="223.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParser::parse (11 samples, 0.07%)</title><rect x="510.9" y="197" width="0.9" height="15.0" fill="rgb(244,166,42)" rx="2" ry="2" />
+<text  x="513.94" y="207.5" ></text>
+</g>
+<g >
+<title>tick_sched_do_timer (2 samples, 0.01%)</title><rect x="975.1" y="133" width="0.1" height="15.0" fill="rgb(249,21,50)" rx="2" ry="2" />
+<text  x="978.07" y="143.5" ></text>
+</g>
+<g >
+<title>std::locale::locale (2 samples, 0.01%)</title><rect x="1042.6" y="181" width="0.1" height="15.0" fill="rgb(224,96,52)" rx="2" ry="2" />
+<text  x="1045.57" y="191.5" ></text>
+</g>
+<g >
+<title>hsql_parse (854 samples, 5.39%)</title><rect x="412.5" y="181" width="63.6" height="15.0" fill="rgb(208,57,4)" rx="2" ry="2" />
+<text  x="415.52" y="191.5" >hsql_p..</text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (12 samples, 0.08%)</title><rect x="975.8" y="101" width="0.9" height="15.0" fill="rgb(213,77,2)" rx="2" ry="2" />
+<text  x="978.81" y="111.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (4 samples, 0.03%)</title><rect x="368.1" y="117" width="0.3" height="15.0" fill="rgb(247,208,14)" rx="2" ry="2" />
+<text  x="371.12" y="127.5" ></text>
+</g>
+<g >
+<title>strtoll (10 samples, 0.06%)</title><rect x="1041.1" y="229" width="0.8" height="15.0" fill="rgb(220,24,25)" rx="2" ry="2" />
+<text  x="1044.15" y="239.5" ></text>
+</g>
+<g >
+<title>malloc (11 samples, 0.07%)</title><rect x="309.8" y="213" width="0.8" height="15.0" fill="rgb(211,8,7)" rx="2" ry="2" />
+<text  x="312.79" y="223.5" ></text>
+</g>
+<g >
+<title>hsql_lex (5,907 samples, 37.29%)</title><rect x="536.6" y="229" width="440.1" height="15.0" fill="rgb(221,173,23)" rx="2" ry="2" />
+<text  x="539.64" y="239.5" >hsql_lex</text>
+</g>
+<g >
+<title>std::vector&lt;void*, std::allocator&lt;void*&gt; &gt;::operator= (15 samples, 0.09%)</title><rect x="519.8" y="181" width="1.1" height="15.0" fill="rgb(251,30,30)" rx="2" ry="2" />
+<text  x="522.80" y="191.5" ></text>
+</g>
+<g >
+<title>prepare_exit_to_usermode (4 samples, 0.03%)</title><rect x="368.1" y="197" width="0.3" height="15.0" fill="rgb(220,152,32)" rx="2" ry="2" />
+<text  x="371.12" y="207.5" ></text>
+</g>
+<g >
+<title>std::ostream::sentry::sentry (13 samples, 0.08%)</title><rect x="343.4" y="213" width="1.0" height="15.0" fill="rgb(238,117,47)" rx="2" ry="2" />
+<text  x="346.39" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;short, std::allocator&lt;short&gt; &gt;::_M_realloc_insert&lt;short const&amp;&gt; (2 samples, 0.01%)</title><rect x="355.3" y="213" width="0.2" height="15.0" fill="rgb(207,12,14)" rx="2" ry="2" />
+<text  x="358.31" y="223.5" ></text>
+</g>
+<g >
+<title>std::basic_ios&lt;char, std::char_traits&lt;char&gt; &gt;::_M_cache_locale (2 samples, 0.01%)</title><rect x="1158.6" y="245" width="0.2" height="15.0" fill="rgb(220,20,54)" rx="2" ry="2" />
+<text  x="1161.64" y="255.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (6 samples, 0.04%)</title><rect x="975.0" y="197" width="0.4" height="15.0" fill="rgb(236,80,18)" rx="2" ry="2" />
+<text  x="977.99" y="207.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (5 samples, 0.03%)</title><rect x="1005.8" y="197" width="0.3" height="15.0" fill="rgb(211,120,53)" rx="2" ry="2" />
+<text  x="1008.76" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_sync (2 samples, 0.01%)</title><rect x="1005.6" y="229" width="0.2" height="15.0" fill="rgb(223,76,30)" rx="2" ry="2" />
+<text  x="1008.61" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParserResult::addStatement (2 samples, 0.01%)</title><rect x="282.2" y="213" width="0.2" height="15.0" fill="rgb(254,198,10)" rx="2" ry="2" />
+<text  x="285.22" y="223.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (5 samples, 0.03%)</title><rect x="179.3" y="197" width="0.3" height="15.0" fill="rgb(235,117,16)" rx="2" ry="2" />
+<text  x="182.26" y="207.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (5 samples, 0.03%)</title><rect x="521.6" y="197" width="0.4" height="15.0" fill="rgb(206,67,20)" rx="2" ry="2" />
+<text  x="524.59" y="207.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (4 samples, 0.03%)</title><rect x="141.3" y="69" width="0.3" height="15.0" fill="rgb(239,44,12)" rx="2" ry="2" />
+<text  x="144.27" y="79.5" ></text>
+</g>
+<g >
+<title>hsql_lex (3 samples, 0.02%)</title><rect x="185.0" y="181" width="0.2" height="15.0" fill="rgb(230,228,16)" rx="2" ry="2" />
+<text  x="188.00" y="191.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_init (5 samples, 0.03%)</title><rect x="1042.2" y="181" width="0.4" height="15.0" fill="rgb(236,87,29)" rx="2" ry="2" />
+<text  x="1045.19" y="191.5" ></text>
+</g>
+<g >
+<title>hsql_parse (49 samples, 0.31%)</title><rect x="515.7" y="181" width="3.7" height="15.0" fill="rgb(207,33,2)" rx="2" ry="2" />
+<text  x="518.70" y="191.5" ></text>
+</g>
+<g >
+<title>std::ios_base::_M_init (25 samples, 0.16%)</title><rect x="329.2" y="213" width="1.9" height="15.0" fill="rgb(215,100,31)" rx="2" ry="2" />
+<text  x="332.23" y="223.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="56.2" y="101" width="0.3" height="15.0" fill="rgb(239,30,36)" rx="2" ry="2" />
+<text  x="59.19" y="111.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_replace (5 samples, 0.03%)</title><rect x="1155.8" y="245" width="0.4" height="15.0" fill="rgb(253,86,30)" rx="2" ry="2" />
+<text  x="1158.80" y="255.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (4 samples, 0.03%)</title><rect x="141.3" y="85" width="0.3" height="15.0" fill="rgb(254,17,11)" rx="2" ry="2" />
+<text  x="144.27" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (108 samples, 0.68%)</title><rect x="386.2" y="181" width="8.1" height="15.0" fill="rgb(213,84,21)" rx="2" ry="2" />
+<text  x="389.22" y="191.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::_M_pbump (10 samples, 0.06%)</title><rect x="1004.9" y="229" width="0.7" height="15.0" fill="rgb(247,23,2)" rx="2" ry="2" />
+<text  x="1007.87" y="239.5" ></text>
+</g>
+<g >
+<title>hsql_parse (8 samples, 0.05%)</title><rect x="515.0" y="149" width="0.6" height="15.0" fill="rgb(237,165,36)" rx="2" ry="2" />
+<text  x="517.96" y="159.5" ></text>
+</g>
+<g >
+<title>hsql::SQLParserResult::reset (3 samples, 0.02%)</title><rect x="511.8" y="197" width="0.3" height="15.0" fill="rgb(222,87,14)" rx="2" ry="2" />
+<text  x="514.83" y="207.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (13 samples, 0.08%)</title><rect x="975.7" y="181" width="1.0" height="15.0" fill="rgb(233,172,37)" rx="2" ry="2" />
+<text  x="978.74" y="191.5" ></text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.28] (4 samples, 0.03%)</title><rect x="58.1" y="245" width="0.3" height="15.0" fill="rgb(208,5,23)" rx="2" ry="2" />
+<text  x="61.05" y="255.5" ></text>
+</g>
+<g >
+<title>hsql::SelectStatement::~SelectStatement (2 samples, 0.01%)</title><rect x="1122.7" y="245" width="0.2" height="15.0" fill="rgb(234,147,27)" rx="2" ry="2" />
+<text  x="1125.73" y="255.5" ></text>
+</g>
+<g >
+<title>hsql_lex_destroy (13 samples, 0.08%)</title><rect x="976.7" y="229" width="1.0" height="15.0" fill="rgb(210,132,52)" rx="2" ry="2" />
+<text  x="979.71" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (72 samples, 0.45%)</title><rect x="502.7" y="197" width="5.3" height="15.0" fill="rgb(231,70,31)" rx="2" ry="2" />
+<text  x="505.67" y="207.5" ></text>
+</g>
+<g >
+<title>cfree (38 samples, 0.24%)</title><rect x="1113.5" y="245" width="2.8" height="15.0" fill="rgb(239,209,13)" rx="2" ry="2" />
+<text  x="1116.49" y="255.5" ></text>
+</g>
+<g >
+<title>std::__ostream_insert&lt;char, std::char_traits&lt;char&gt; &gt; (8 samples, 0.05%)</title><rect x="1158.0" y="245" width="0.6" height="15.0" fill="rgb(232,179,52)" rx="2" ry="2" />
+<text  x="1161.04" y="255.5" ></text>
+</g>
+<g >
+<title>hsql__scan_bytes (41 samples, 0.26%)</title><rect x="532.0" y="229" width="3.1" height="15.0" fill="rgb(236,223,22)" rx="2" ry="2" />
+<text  x="535.02" y="239.5" ></text>
+</g>
+<g >
+<title>[unknown] (10 samples, 0.06%)</title><rect x="515.0" y="181" width="0.7" height="15.0" fill="rgb(235,100,22)" rx="2" ry="2" />
+<text  x="517.96" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (44 samples, 0.28%)</title><rect x="386.6" y="165" width="3.3" height="15.0" fill="rgb(223,177,22)" rx="2" ry="2" />
+<text  x="389.60" y="175.5" ></text>
+</g>
+<g >
+<title>[libc-2.30.so] (623 samples, 3.93%)</title><rect x="10.1" y="245" width="46.4" height="15.0" fill="rgb(236,2,9)" rx="2" ry="2" />
+<text  x="13.07" y="255.5" >[lib..</text>
+</g>
+<g >
+<title>std::ostream::sentry::sentry (4 samples, 0.03%)</title><rect x="1030.7" y="229" width="0.3" height="15.0" fill="rgb(232,117,2)" rx="2" ry="2" />
+<text  x="1033.72" y="239.5" ></text>
+</g>
+<g >
+<title>hsql::Expr::~Expr (86 samples, 0.54%)</title><rect x="1116.3" y="245" width="6.4" height="15.0" fill="rgb(253,74,39)" rx="2" ry="2" />
+<text  x="1119.32" y="255.5" ></text>
+</g>
+<g >
+<title>perf (4 samples, 0.03%)</title><rect x="1189.7" y="261" width="0.3" height="15.0" fill="rgb(209,94,16)" rx="2" ry="2" />
+<text  x="1192.70" y="271.5" ></text>
+</g>
+<g >
+<title>hsql_lex (130 samples, 0.82%)</title><rect x="198.6" y="197" width="9.6" height="15.0" fill="rgb(213,149,49)" rx="2" ry="2" />
+<text  x="201.56" y="207.5" ></text>
+</g>
+<g >
+<title>hsql__scan_buffer (6 samples, 0.04%)</title><rect x="531.6" y="229" width="0.4" height="15.0" fill="rgb(237,90,16)" rx="2" ry="2" />
+<text  x="534.57" y="239.5" ></text>
+</g>
+<g >
+<title>exit_to_usermode_loop (4 samples, 0.03%)</title><rect x="56.2" y="197" width="0.3" height="15.0" fill="rgb(243,57,38)" rx="2" ry="2" />
+<text  x="59.19" y="207.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 0.03%)</title><rect x="1189.7" y="229" width="0.3" height="15.0" fill="rgb(232,104,25)" rx="2" ry="2" />
+<text  x="1192.70" y="239.5" ></text>
+</g>
+<g >
+<title>std::use_facet&lt;std::num_get&lt;char, std::istreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; &gt; (40 samples, 0.25%)</title><rect x="348.1" y="213" width="3.0" height="15.0" fill="rgb(220,194,39)" rx="2" ry="2" />
+<text  x="351.08" y="223.5" ></text>
+</g>
+<g >
+<title>std::has_facet&lt;std::num_get&lt;char, std::istreambuf_iterator&lt;char, std::char_traits&lt;char&gt; &gt; &gt; &gt; (58 samples, 0.37%)</title><rect x="320.9" y="213" width="4.3" height="15.0" fill="rgb(214,56,5)" rx="2" ry="2" />
+<text  x="323.89" y="223.5" ></text>
+</g>
+<g >
+<title>operator delete (3 samples, 0.02%)</title><rect x="1002.4" y="229" width="0.2" height="15.0" fill="rgb(207,108,13)" rx="2" ry="2" />
+<text  x="1005.41" y="239.5" ></text>
+</g>
+<g >
+<title>native_write_msr (4 samples, 0.03%)</title><rect x="141.3" y="53" width="0.3" height="15.0" fill="rgb(207,174,17)" rx="2" ry="2" />
+<text  x="144.27" y="63.5" ></text>
+</g>
+<g >
+<title>setup_new_exec (4 samples, 0.03%)</title><rect x="1189.7" y="133" width="0.3" height="15.0" fill="rgb(219,48,10)" rx="2" ry="2" />
+<text  x="1192.70" y="143.5" ></text>
+</g>
+<g >
+<title>tick_do_update_jiffies64.part.0 (2 samples, 0.01%)</title><rect x="975.1" y="117" width="0.1" height="15.0" fill="rgb(254,164,7)" rx="2" ry="2" />
+<text  x="978.07" y="127.5" ></text>
+</g>
+<g >
+<title>strtod (4 samples, 0.03%)</title><rect x="1040.9" y="229" width="0.2" height="15.0" fill="rgb(237,229,39)" rx="2" ry="2" />
+<text  x="1043.85" y="239.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (5 samples, 0.03%)</title><rect x="975.0" y="181" width="0.4" height="15.0" fill="rgb(249,17,52)" rx="2" ry="2" />
+<text  x="977.99" y="191.5" ></text>
+</g>
+</g>
+</svg>

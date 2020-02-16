@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>measurement on _</title>
+    <link>https://sriduth.github.io/tags/measurement/</link>
+    <description>Recent content in measurement on _</description>
+    <generator>Hugo -- gohugo.io</generator>
+    <language>en</language>
+    <copyright>&amp;copy; Copyright 2020 Sriduth Jayhari</copyright>
+    <lastBuildDate>Sun, 16 Feb 2020 00:00:00 +0000</lastBuildDate>
+    
+	<atom:link href="https://sriduth.github.io/tags/measurement/index.xml" rel="self" type="application/rss+xml" />
+    
+    
+    <item>
+      <title>ANTLRv4 vs Bison C&#43;&#43; target for SQL parsing</title>
+      <link>https://sriduth.github.io/posts/envoy-accesslog-parser/</link>
+      <pubDate>Sun, 16 Feb 2020 00:00:00 +0000</pubDate>
+      
+      <guid>https://sriduth.github.io/posts/envoy-accesslog-parser/</guid>
+      <description>The envoy L4/L7 network proxy has an extension that can act as a SQL proxy. The library used is based off a parser that is generated using YACC.  We compare the performance by generating an ANTLRv4 parser from an SQL grammar. YACC Parser   https://github.com/envoyproxy/sql-parser implements the SQL parser used by Envoy proxy. The authors have setup a benchmark using TPC-H1 queries inputs and google benchmark to run the benchmarks ANTLRv4 parser   https://github.</description>
+    </item>
+    
+  </channel>
+</rss>
